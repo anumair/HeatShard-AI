@@ -9,3 +9,7 @@ SHARDS = [
 ]
 
 WINDOW_SECONDS = 5
+
+# Component 1 (Metrics Collection) settings
+CACHE_CAPACITY = 200          # size of the simulated app-level LRU cache
+DIAG_SAMPLE_RATE = 0.01       # 1-in-100 full query logging

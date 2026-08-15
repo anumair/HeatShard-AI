@@ -1,0 +1,35 @@
+services:
+  shard-0:
+    image: redis:7-alpine
+    container_name: heatshard-shard-0
+    ports:
+      - "7001:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+  shard-1:
+    image: redis:7-alpine
+    container_name: heatshard-shard-1
+    ports:
+      - "7002:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+  shard-2:
+    image: redis:7-alpine
+    container_name: heatshard-shard-2
+    ports:
+      - "7003:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+  shard-3:
+    image: redis:7-alpine
+    container_name: heatshard-shard-3
+    ports:
+      - "7004:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+  shard-4:
+    image: redis:7-alpine
+    container_name: heatshard-shard-4
+    ports:
+      - "7005:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]

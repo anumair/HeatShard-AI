@@ -7,3 +7,5 @@ venv/
 .env
 *.sqlite3
 data/*.db
+data/scenarios/
+data/last_scenario.json

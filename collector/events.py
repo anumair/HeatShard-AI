@@ -13,6 +13,16 @@ from pathlib import Path
 DEFAULT_EVENTS_PATH = Path(__file__).resolve().parent.parent / "data" / "events.json"
 
 
+def write_events(events, path=None):
+    """Overwrite the event-metadata feed. Scenarios call this to register
+    events (e.g. an upcoming flash sale) before the corresponding traffic
+    spike actually happens."""
+    path = Path(path) if path else DEFAULT_EVENTS_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(events, f, indent=2)
+
+
 class EventStore:
     def __init__(self, path=None):
         self.path = Path(path) if path else DEFAULT_EVENTS_PATH

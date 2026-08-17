@@ -1,8 +1,12 @@
-"""Stage 0/1 load generator: uniform-random reads/writes across all shards,
-routed through the MetricsCollector so every request feeds Component 1's
-per-record counters. A fraction of ops touch a related record group
-(product/reviews/inventory for the same index) in one go, to populate the
-co-access graph. Zipfian distribution and flash-sale spikes land in Stage 2.
+"""General-purpose load generator: reads/writes across all shards, routed
+through the MetricsCollector so every request feeds Component 1's
+per-record counters. Supports uniform or Zipfian key selection. A fraction
+of ops touch a related record group (product/reviews/inventory for the
+same index) in one go, to populate the co-access graph.
+
+For a repeatable, scripted flash-sale scenario (Stage 2's actual
+deliverable), see flash_sale_scenario.py -- this script is the general
+manual/ad-hoc traffic driver.
 """
 
 import argparse
@@ -16,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from collector.middleware import MetricsCollector  # noqa: E402
 from collector.window_worker import WindowWorker  # noqa: E402
+from simulator.zipf import ZipfSampler  # noqa: E402
 
 
 def related_keys(i: int):
@@ -31,10 +36,28 @@ def touch(collector: MetricsCollector, key: str, write_ratio: float, ops: int) -
     return shard
 
 
-def run(num_keys: int, duration: float, rate: float, write_ratio: float, group_ratio: float, window_seconds: float):
+def make_key_picker(num_keys: int, distribution: str, skew: float):
+    if distribution == "zipf":
+        sampler = ZipfSampler(num_keys, skew=skew)
+        return lambda: sampler.sample()
+    return lambda: random.randrange(num_keys)
+
+
+def run(
+    num_keys: int,
+    duration: float,
+    rate: float,
+    write_ratio: float,
+    group_ratio: float,
+    window_seconds: float,
+    distribution: str,
+    skew: float,
+):
     collector = MetricsCollector()
     worker = WindowWorker(collector, interval_seconds=window_seconds)
     worker.start()
+
+    pick_rank = make_key_picker(num_keys, distribution, skew)
 
     hits = Counter()
     latencies = []
@@ -47,7 +70,7 @@ def run(num_keys: int, duration: float, rate: float, write_ratio: float, group_r
         t0 = time.perf_counter()
 
         if random.random() < group_ratio:
-            i = random.randrange(num_keys)
+            i = pick_rank()
             keys = related_keys(i)
             for key in keys:
                 shard = touch(collector, key, write_ratio, ops)
@@ -55,7 +78,7 @@ def run(num_keys: int, duration: float, rate: float, write_ratio: float, group_r
                 ops += 1
             collector.transaction(keys)
         else:
-            key = f"product:{random.randrange(num_keys)}"
+            key = f"product:{pick_rank()}"
             shard = touch(collector, key, write_ratio, ops)
             hits[shard] += 1
             ops += 1
@@ -85,6 +108,17 @@ if __name__ == "__main__":
     parser.add_argument("--write-ratio", type=float, default=0.3)
     parser.add_argument("--group-ratio", type=float, default=0.15, help="fraction of ticks that touch a related record group")
     parser.add_argument("--window-seconds", type=float, default=5.0)
+    parser.add_argument("--distribution", choices=["uniform", "zipf"], default="uniform")
+    parser.add_argument("--skew", type=float, default=1.2, help="zipf skew parameter (higher = more skewed)")
     args = parser.parse_args()
 
-    run(args.num_keys, args.duration, args.rate, args.write_ratio, args.group_ratio, args.window_seconds)
+    run(
+        args.num_keys,
+        args.duration,
+        args.rate,
+        args.write_ratio,
+        args.group_ratio,
+        args.window_seconds,
+        args.distribution,
+        args.skew,
+    )

@@ -2,13 +2,13 @@
   {
     "record_id": "product:7",
     "event_type": "flash_sale",
-    "scheduled_time": 1786796645.704798,
+    "scheduled_time": 1786988998.079416,
     "expected_magnitude": 8.0
   },
   {
     "record_id": "product:23",
     "event_type": "flash_sale",
-    "scheduled_time": 1786796645.704798,
+    "scheduled_time": 1786988998.079416,
     "expected_magnitude": 8.0
   }
 ]

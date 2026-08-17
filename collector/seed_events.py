@@ -6,14 +6,13 @@ checkpoint test / load generator.
 """
 
 import argparse
-import json
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from collector.events import DEFAULT_EVENTS_PATH  # noqa: E402
+from collector.events import DEFAULT_EVENTS_PATH, write_events  # noqa: E402
 
 
 def main():
@@ -37,12 +36,8 @@ def main():
         for record_id in records
     ]
 
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w") as f:
-        json.dump(events, f, indent=2)
-
-    print(f"wrote {len(events)} event(s) to {out_path}, scheduled_time = now + {args.lead_seconds}s")
+    write_events(events, path=args.out)
+    print(f"wrote {len(events)} event(s) to {args.out}, scheduled_time = now + {args.lead_seconds}s")
 
 
 if __name__ == "__main__":

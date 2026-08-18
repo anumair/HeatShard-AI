@@ -4,21 +4,20 @@ Predictive hotspot management for distributed e-commerce databases. See
 `METHODOLOGY.md` for the full problem statement, architecture, and evaluation
 design.
 
-## Status: Stage 2 — Load Simulator with Flash-Sale Injection
+## Status: Stage 3 — Adaptive Heat Index
 
-Component 1 (metrics collection) is implemented, and the load simulator now
-produces realistic, repeatable test traffic: Zipfian-distributed baseline
-demand plus a scriptable flash-sale scenario with scheduled event metadata
-and a ground-truth manifest for later prediction-model training.
+Component 2 is implemented: raw per-record counters are turned into a
+single per-window "heat score" -- decayed, z-score normalized, weighted,
+and periodically re-weighted against observed outcomes.
 
 ```
 collector/    # Stage 1: metrics middleware, windowing, event feed, diagnostics
-predictor/    # Stage 3-4: adaptive heat index + prediction engine
+predictor/    # Stage 3: adaptive heat index (Stage 4 prediction engine still to come)
 planner/      # Stage 5-6: dependency graph + relocation planner
 dashboard/    # Stage 8: visual demo
 simulator/    # load generator (uniform/zipf) + flash_sale_scenario.py (Stage 2)
 common/       # shared config and shard client used by every component
-data/         # events.json (checked in, illustrative) + generated *.db/scenarios (gitignored)
+data/         # events.json (checked in, illustrative) + generated *.db/scenarios/*.png (gitignored)
 ```
 
 ### Run it
@@ -73,6 +72,36 @@ during `spike` and drop-off in `cooldown` are directly visible, e.g.:
 ```
 product:9   1  2  1  21  27  22   2   1
 ```
+
+### Adaptive Heat Index (Stage 3)
+
+```bash
+python predictor/compute_heat.py --refit-every 10 --min-refit-samples 20
+python predictor/inspect_heat.py --record product:9
+python predictor/plot_heat.py --record product:9 --record product:20
+```
+
+Run this right after a scenario (while `data/events.json` still reflects
+that same run's registered events). `compute_heat.py` replays the
+recorded windows chronologically through `predictor/heat_index.py`:
+
+- 7 raw signals per record per window (QPS, growth rate, avg latency,
+  read/write ratio, cache-miss rate, popularity share, event signal)
+- exponentially decayed between windows so heat cools gradually instead
+  of resetting to zero the instant a record goes quiet
+- z-score normalized across that window's active records, then combined
+  via the weighted `Heat_i(t)` formula from the methodology
+- weights start fixed (`predictor/features.py`) and are periodically
+  refit via linear regression against observed outcomes -- did the
+  record actually spike in the window that followed? `--refit-every`
+  defaults to 10 here for a fast demo; the methodology's target cadence
+  for real use is 20-50 windows, with more history the refit is far less
+  noisy than what you'll see in a 15-20 window demo run.
+
+`inspect_heat.py` prints an ASCII bar chart per window; `plot_heat.py`
+renders an actual PNG (`data/heat_plot.png`) -- the Stage 3 checkpoint
+test: heat should visibly rise leading into the flash sale and decay
+afterward for the spike records identified in the scenario's manifest.
 
 ### Stop it
 

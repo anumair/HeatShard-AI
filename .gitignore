@@ -9,3 +9,4 @@ venv/
 data/*.db
 data/scenarios/
 data/last_scenario.json
+data/*.png

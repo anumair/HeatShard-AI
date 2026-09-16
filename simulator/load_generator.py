@@ -1,8 +1,10 @@
 """General-purpose load generator: reads/writes across all shards, routed
 through the MetricsCollector so every request feeds Component 1's
-per-record counters. Supports uniform or Zipfian key selection. A fraction
-of ops touch a related record group (product/reviews/inventory for the
-same index) in one go, to populate the co-access graph.
+per-record counters. Supports uniform or Zipfian key selection, and either
+the synthetic key space (product:i / reviews:i / inventory:i, default) or
+real product ids from the Olist dataset (--key-source olist). A fraction
+of ops touch a related record group in one go, to populate the co-access
+graph.
 
 For a repeatable, scripted flash-sale scenario (Stage 2's actual
 deliverable), see flash_sale_scenario.py -- this script is the general
@@ -20,11 +22,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from collector.middleware import MetricsCollector  # noqa: E402
 from collector.window_worker import WindowWorker  # noqa: E402
+from common.keyspace import KeySpace  # noqa: E402
 from simulator.zipf import ZipfSampler  # noqa: E402
-
-
-def related_keys(i: int):
-    return [f"product:{i}", f"reviews:{i}", f"inventory:{i}"]
 
 
 def touch(collector: MetricsCollector, key: str, write_ratio: float, ops: int) -> str:
@@ -52,7 +51,11 @@ def run(
     window_seconds: float,
     distribution: str,
     skew: float,
+    key_source: str,
 ):
+    key_space = KeySpace.synthetic(num_keys) if key_source == "synthetic" else KeySpace.from_olist(num_keys=num_keys)
+    num_keys = key_space.num_keys
+
     collector = MetricsCollector()
     worker = WindowWorker(collector, interval_seconds=window_seconds)
     worker.start()
@@ -71,14 +74,14 @@ def run(
 
         if random.random() < group_ratio:
             i = pick_rank()
-            keys = related_keys(i)
+            keys = key_space.related_keys(i)
             for key in keys:
                 shard = touch(collector, key, write_ratio, ops)
                 hits[shard] += 1
                 ops += 1
             collector.transaction(keys)
         else:
-            key = f"product:{pick_rank()}"
+            key = key_space.record_id(pick_rank())
             shard = touch(collector, key, write_ratio, ops)
             hits[shard] += 1
             ops += 1
@@ -110,6 +113,7 @@ if __name__ == "__main__":
     parser.add_argument("--window-seconds", type=float, default=5.0)
     parser.add_argument("--distribution", choices=["uniform", "zipf"], default="uniform")
     parser.add_argument("--skew", type=float, default=1.2, help="zipf skew parameter (higher = more skewed)")
+    parser.add_argument("--key-source", choices=["synthetic", "olist"], default="synthetic")
     args = parser.parse_args()
 
     run(
@@ -121,4 +125,5 @@ if __name__ == "__main__":
         args.window_seconds,
         args.distribution,
         args.skew,
+        args.key_source,
     )

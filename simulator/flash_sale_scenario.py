@@ -33,7 +33,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from collector.events import write_events  # noqa: E402
 from collector.middleware import MetricsCollector  # noqa: E402
 from collector.window_worker import WindowWorker  # noqa: E402
-from simulator.load_generator import related_keys, touch  # noqa: E402
+from common.keyspace import KeySpace  # noqa: E402
+from simulator.load_generator import touch  # noqa: E402
 from simulator.zipf import ZipfSampler  # noqa: E402
 
 SCENARIOS_DIR = Path(__file__).resolve().parent.parent / "data" / "scenarios"
@@ -56,22 +57,23 @@ class ScenarioConfig:
     spike_num_records: int = 4
     spike_magnitude: float = 8.0
     spike_bias: float = 0.85  # P(traffic goes to a spike record) during the spike phase
+    key_source: str = "synthetic"  # or "olist" for real Olist product ids
 
 
-def run_phase(collector, pick_rank, label, duration, rate, write_ratio, group_ratio, rng):
+def run_phase(collector, key_space, pick_rank, label, duration, rate, write_ratio, group_ratio, rng):
     print(f"-- {label} ({duration:.0f}s, ~{rate:.0f} ops/sec) --")
     interval = 1.0 / rate if rate > 0 else 0
     end = time.monotonic() + duration
     ops = 0
     while time.monotonic() < end:
         if rng.random() < group_ratio:
-            keys = related_keys(pick_rank())
+            keys = key_space.related_keys(pick_rank())
             for key in keys:
                 touch(collector, key, write_ratio, ops)
                 ops += 1
             collector.transaction(keys)
         else:
-            touch(collector, f"product:{pick_rank()}", write_ratio, ops)
+            touch(collector, key_space.record_id(pick_rank()), write_ratio, ops)
             ops += 1
         if interval:
             time.sleep(interval)
@@ -94,13 +96,20 @@ def print_spike_record_history(db_path, spike_records):
 
 def run(cfg: ScenarioConfig, db_path=None, events_path=None):
     rng = random.Random(cfg.seed)
+    key_space = (
+        KeySpace.synthetic(cfg.num_keys)
+        if cfg.key_source == "synthetic"
+        else KeySpace.from_olist(num_keys=cfg.num_keys)
+    )
+    num_keys = key_space.num_keys
+
     collector = MetricsCollector(db_path=db_path)
     worker = WindowWorker(collector, interval_seconds=cfg.window_seconds)
     worker.start()
 
-    baseline_sampler = ZipfSampler(cfg.num_keys, skew=cfg.skew, seed=cfg.seed)
-    spike_ranks = rng.sample(range(cfg.num_keys), cfg.spike_num_records)
-    spike_records = [f"product:{i}" for i in spike_ranks]
+    baseline_sampler = ZipfSampler(num_keys, skew=cfg.skew, seed=cfg.seed)
+    spike_ranks = rng.sample(range(num_keys), cfg.spike_num_records)
+    spike_records = [key_space.record_id(i) for i in spike_ranks]
 
     def normal_pick():
         return baseline_sampler.sample()
@@ -113,7 +122,7 @@ def run(cfg: ScenarioConfig, db_path=None, events_path=None):
     phases = []
 
     t0 = time.time()
-    ops_baseline = run_phase(collector, normal_pick, "baseline", cfg.baseline_seconds, cfg.rate, cfg.write_ratio, cfg.group_ratio, rng)
+    ops_baseline = run_phase(collector, key_space, normal_pick, "baseline", cfg.baseline_seconds, cfg.rate, cfg.write_ratio, cfg.group_ratio, rng)
     t1 = time.time()
     phases.append({"name": "baseline", "start": t0, "end": t1, "ops": ops_baseline})
 
@@ -132,21 +141,21 @@ def run(cfg: ScenarioConfig, db_path=None, events_path=None):
     print(f"\nregistered event metadata for {spike_records} -> spike scheduled at +{cfg.lead_seconds:.0f}s\n")
 
     ops_pre = run_phase(
-        collector, normal_pick, "pre_spike (event known, traffic still normal)",
+        collector, key_space, normal_pick, "pre_spike (event known, traffic still normal)",
         cfg.lead_seconds, cfg.rate, cfg.write_ratio, cfg.group_ratio, rng,
     )
     t2 = time.time()
     phases.append({"name": "pre_spike", "start": t1, "end": t2, "ops": ops_pre})
 
     ops_spike = run_phase(
-        collector, spike_pick, f"SPIKE on {spike_records}",
+        collector, key_space, spike_pick, f"SPIKE on {spike_records}",
         cfg.spike_seconds, cfg.rate, cfg.write_ratio, cfg.group_ratio, rng,
     )
     t3 = time.time()
     phases.append({"name": "spike", "start": t2, "end": t3, "ops": ops_spike})
 
     ops_cool = run_phase(
-        collector, normal_pick, "cooldown",
+        collector, key_space, normal_pick, "cooldown",
         cfg.cooldown_seconds, cfg.rate, cfg.write_ratio, cfg.group_ratio, rng,
     )
     t4 = time.time()
@@ -200,6 +209,7 @@ if __name__ == "__main__":
     parser.add_argument("--spike-bias", type=float, default=ScenarioConfig.spike_bias)
     parser.add_argument("--db", default=None, help="metrics db path (default: data/metrics.db)")
     parser.add_argument("--events-out", default=None, help="event feed path (default: data/events.json)")
+    parser.add_argument("--key-source", choices=["synthetic", "olist"], default=ScenarioConfig.key_source)
     args = parser.parse_args()
 
     cfg = ScenarioConfig(
@@ -213,6 +223,7 @@ if __name__ == "__main__":
         baseline_seconds=args.baseline_seconds,
         lead_seconds=args.lead_seconds,
         spike_seconds=args.spike_seconds,
+        key_source=args.key_source,
         cooldown_seconds=args.cooldown_seconds,
         spike_num_records=args.spike_num_records,
         spike_magnitude=args.spike_magnitude,

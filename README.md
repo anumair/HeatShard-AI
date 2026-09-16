@@ -17,8 +17,34 @@ planner/      # Stage 5-6: dependency graph + relocation planner
 dashboard/    # Stage 8: visual demo
 simulator/    # load generator (uniform/zipf) + flash_sale_scenario.py (Stage 2)
 common/       # shared config and shard client used by every component
-data/         # events.json (checked in, illustrative) + generated *.db/scenarios/*.png (gitignored)
+data/         # events.json (checked in, illustrative) + generated *.db/scenarios/*.png/olist_records.json (gitignored)
 ```
+
+### Real dataset (optional): Olist Brazilian E-commerce
+
+By default every script above uses a fully synthetic key space
+(`product:i` / `reviews:i` / `inventory:i`). You can instead point the
+simulator at real product ids from the [Olist Brazilian E-commerce
+dataset](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce) via
+`--key-source olist` -- traffic *shape* stays synthetic (still Zipfian +
+flash-sale injection), only the record identities and their payloads
+become real. Requires a Kaggle account + API token
+(`~/.kaggle/access_token`, see Kaggle's own "API Token" setup page) and
+`pip install -r requirements.txt` (adds `pandas`, `kagglehub`).
+
+```bash
+python simulator/build_olist_keyspace.py --num-products 200   # one-time ETL, writes data/olist_records.json
+python simulator/seed_dataset.py                              # writes real product/review/order payloads into Redis
+python simulator/flash_sale_scenario.py --key-source olist --spike-num-records 3
+python predictor/compute_heat.py && python predictor/plot_heat.py --record "product:<a real id from the scenario output>"
+```
+
+Olist has no inventory/stock table, so the third leg of the
+product/reviews/inventory co-access grouping is repurposed as `order:<id>`
+(order volume + freight) for this key source -- the closest real
+analogue available. `data/olist_records.json` is gitignored and not
+redistributed (Olist's data is CC BY-NC-SA licensed); regenerate it
+locally with your own Kaggle credentials.
 
 ### Run it
 

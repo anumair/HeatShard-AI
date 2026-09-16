@@ -4,20 +4,21 @@ Predictive hotspot management for distributed e-commerce databases. See
 `METHODOLOGY.md` for the full problem statement, architecture, and evaluation
 design.
 
-## Status: Stage 3 — Adaptive Heat Index
+## Status: Stage 4 — Hybrid Prediction Engine
 
-Component 2 is implemented: raw per-record counters are turned into a
-single per-window "heat score" -- decayed, z-score normalized, weighted,
-and periodically re-weighted against observed outcomes.
+Component 3 is implemented: a trend sub-model + a trained XGBoost
+sub-model are combined into P(hotspot in next window) + a confidence
+score per record, gated through an adaptive confidence threshold that
+tunes itself against its own recent track record.
 
 ```
 collector/    # Stage 1: metrics middleware, windowing, event feed, diagnostics
-predictor/    # Stage 3: adaptive heat index (Stage 4 prediction engine still to come)
+predictor/    # Stage 3: adaptive heat index. Stage 4: trend + XGBoost prediction engine
 planner/      # Stage 5-6: dependency graph + relocation planner
 dashboard/    # Stage 8: visual demo
-simulator/    # load generator (uniform/zipf) + flash_sale_scenario.py (Stage 2)
+simulator/    # load generator (uniform/zipf) + flash_sale_scenario.py (Stage 2) + generate_training_runs.py (Stage 4)
 common/       # shared config and shard client used by every component
-data/         # events.json (checked in, illustrative) + generated *.db/scenarios/*.png/olist_records.json (gitignored)
+data/         # events.json (checked in, illustrative) + generated *.db/scenarios/*.png/olist_records.json/training_runs/xgb_model.json (gitignored)
 ```
 
 ### Record/key space: Olist Brazilian E-commerce (default)
@@ -134,6 +135,54 @@ recorded windows chronologically through `predictor/heat_index.py`:
 renders an actual PNG (`data/heat_plot.png`) -- the Stage 3 checkpoint
 test: heat should visibly rise leading into the flash sale and decay
 afterward for the spike records identified in the scenario's manifest.
+
+### Hybrid Prediction Engine (Stage 4)
+
+```bash
+# 1. generate several scenarios as labeled training data (~1min each)
+python simulator/generate_training_runs.py --num-runs 16 --seed-start 200
+
+# 2. train the XGBoost sub-model on all of them (repeat --db/--events per run)
+python predictor/train_xgboost.py \
+  --db data/training_runs/run_200.db --events data/training_runs/run_200_events.json \
+  --db data/training_runs/run_201.db --events data/training_runs/run_201_events.json \
+  ... # one pair per generated run
+
+# 3. run a fresh (held-out) scenario, then the prediction engine over it
+python simulator/flash_sale_scenario.py --seed 999
+python predictor/run_prediction.py --manifest data/scenarios/scenario_<ts from step 3>.json
+```
+
+`predictor/heat_index.py` (Stage 3) is reused as-is for feature
+extraction; Stage 4 adds:
+
+- `predictor/trend_model.py` -- fits a slope over each record's last 5
+  heat scores, z-scores it across the window's population, sigmoid ->
+  `p_trend`
+- `predictor/xgb_model.py` + `train_xgboost.py` -- an XGBoost classifier
+  trained on the heat index's own 7 normalized features, using the exact
+  same "did this record spike in the window that followed" labeling the
+  weight refitting already relies on (via `HeatIndex`'s `sample_callback`
+  hook), so training labels stay consistent with the rest of the system.
+  One scenario alone rarely has enough positive (spike) windows to train
+  on well -- `generate_training_runs.py` produces several independent
+  scenarios into separate db/events pairs for this.
+- `predictor/prediction_engine.py` -- averages `p_trend`/`p_xgb` into
+  `p_ensemble`, with confidence = model agreement (`1 - |p_trend - p_xgb|`);
+  degrades gracefully to trend-only if no XGBoost model is loaded yet
+- `predictor/confidence.py` -- `AdaptiveThreshold`: tracks the precision
+  of the last 10 flagged predictions and raises the acting threshold when
+  flags have been low-value, lowers it when they've been reliably correct
+
+`run_prediction.py` is the Stage 4 checkpoint test: it prints each spike
+record's `p_ensemble`/confidence trajectory against the scenario's phase
+boundaries. On a held-out scenario (seed unseen during training), spike
+records get flagged with high confidence right at the spike's first
+window -- computed from the *prior* (still-quiet) window's features, so
+it's a genuinely proactive flag, not a reactive one. With only a handful
+of pre-spike windows in a short demo scenario, don't expect a long,
+gradually-rising lead-up -- the real signal is the flag landing on the
+transition window itself rather than several windows into the spike.
 
 ### Stop it
 

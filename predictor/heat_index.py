@@ -43,6 +43,7 @@ class HeatIndex:
         decay_lambda: float = DECAY_LAMBDA,
         refit_every: int = 25,
         min_refit_samples: int = 30,
+        sample_callback=None,
     ):
         self.weights = dict(weights or DEFAULT_WEIGHTS)
         self.events = events or EventStore()
@@ -52,6 +53,13 @@ class HeatIndex:
         self._pending_features = {}  # record_id -> normalized features from the previous window
         self.weight_history = []  # (window_index, weights) appended on every refit
         self._window_index = 0
+        # Called as sample_callback(record_id, normalized_features, label) every time a
+        # label is resolved -- lets Stage 4's XGBoost training reuse this exact same
+        # "did it spike in the window that followed" signal instead of recomputing it.
+        self._sample_callback = sample_callback
+        # Normalized (z-scored) features from the most recently processed window --
+        # Stage 4's live PredictionEngine reads this right after process_window().
+        self.last_normalized_features = {}
 
     def _event_signal(self, record_id: str, now: float) -> float:
         best = 0.0
@@ -87,7 +95,7 @@ class HeatIndex:
         z = (matrix - mean) / std
         return {rid: dict(zip(FEATURE_NAMES, z[i])) for i, rid in enumerate(record_ids)}
 
-    def _is_spike(self, record_id: str, access_count: int) -> bool:
+    def is_spike(self, record_id: str, access_count: int) -> bool:
         history = self._state[record_id].access_history
         if len(history) < 2:
             return False
@@ -105,8 +113,10 @@ class HeatIndex:
         # now that we know what this record actually did this window.
         for record_id, features in self._pending_features.items():
             actual = counters[record_id].access_count if record_id in counters else 0
-            label = 1 if self._is_spike(record_id, actual) else 0
+            label = 1 if self.is_spike(record_id, actual) else 0
             self._fitter.add_sample(features, label)
+            if self._sample_callback:
+                self._sample_callback(record_id, features, label)
 
         raw = {}
         for record_id, c in counters.items():
@@ -133,6 +143,7 @@ class HeatIndex:
             self._state[record_id].access_history.append(c.access_count)
 
         self._pending_features = normalized
+        self.last_normalized_features = normalized
 
         new_weights, refit_happened = self._fitter.maybe_refit(self.weights)
         if refit_happened:

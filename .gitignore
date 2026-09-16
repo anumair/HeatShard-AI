@@ -11,3 +11,5 @@ data/scenarios/
 data/last_scenario.json
 data/*.png
 data/olist_records.json
+data/training_runs/
+data/xgb_model.json

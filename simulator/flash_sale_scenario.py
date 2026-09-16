@@ -57,7 +57,7 @@ class ScenarioConfig:
     spike_num_records: int = 4
     spike_magnitude: float = 8.0
     spike_bias: float = 0.85  # P(traffic goes to a spike record) during the spike phase
-    key_source: str = "synthetic"  # or "olist" for real Olist product ids
+    key_source: str = "olist"  # or "synthetic" for the original product:i / reviews:i / inventory:i scheme
 
 
 def run_phase(collector, key_space, pick_rank, label, duration, rate, write_ratio, group_ratio, rng):

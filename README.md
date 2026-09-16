@@ -20,31 +20,29 @@ common/       # shared config and shard client used by every component
 data/         # events.json (checked in, illustrative) + generated *.db/scenarios/*.png/olist_records.json (gitignored)
 ```
 
-### Real dataset (optional): Olist Brazilian E-commerce
+### Record/key space: Olist Brazilian E-commerce (default)
 
-By default every script above uses a fully synthetic key space
-(`product:i` / `reviews:i` / `inventory:i`). You can instead point the
-simulator at real product ids from the [Olist Brazilian E-commerce
-dataset](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce) via
-`--key-source olist` -- traffic *shape* stays synthetic (still Zipfian +
-flash-sale injection), only the record identities and their payloads
-become real. Requires a Kaggle account + API token
-(`~/.kaggle/access_token`, see Kaggle's own "API Token" setup page) and
-`pip install -r requirements.txt` (adds `pandas`, `kagglehub`).
-
-```bash
-python simulator/build_olist_keyspace.py --num-products 200   # one-time ETL, writes data/olist_records.json
-python simulator/seed_dataset.py                              # writes real product/review/order payloads into Redis
-python simulator/flash_sale_scenario.py --key-source olist --spike-num-records 3
-python predictor/compute_heat.py && python predictor/plot_heat.py --record "product:<a real id from the scenario output>"
-```
+The record/key space is real product ids from the [Olist Brazilian
+E-commerce dataset](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce)
+-- this is the default everywhere (`--key-source olist`), not an add-on.
+Traffic *shape* stays fully synthetic (Zipfian baseline + flash-sale
+injection, unchanged); only the record identities and their payloads are
+real. Requires a Kaggle account + API token (`~/.kaggle/access_token`,
+see Kaggle's own "API Token" setup page) and `pip install -r
+requirements.txt` (adds `pandas`, `kagglehub`) -- both are part of setup
+below, not optional.
 
 Olist has no inventory/stock table, so the third leg of the
 product/reviews/inventory co-access grouping is repurposed as `order:<id>`
-(order volume + freight) for this key source -- the closest real
-analogue available. `data/olist_records.json` is gitignored and not
-redistributed (Olist's data is CC BY-NC-SA licensed); regenerate it
-locally with your own Kaggle credentials.
+(order volume + freight) -- the closest real analogue available.
+`data/olist_records.json` is gitignored and not redistributed (Olist's
+data is CC BY-NC-SA licensed); regenerate it locally with your own Kaggle
+credentials via the setup step below.
+
+The original fully-synthetic key space (`product:i` / `reviews:i` /
+`inventory:i`, no dataset/credentials needed) is still available as an
+explicit fallback: pass `--key-source synthetic` to `load_generator.py`
+or `flash_sale_scenario.py`.
 
 ### Run it
 
@@ -54,13 +52,20 @@ pip install -r requirements.txt
 
 docker compose up -d          # start the 5 Redis shards
 python check_cluster.py       # confirm read/write + latency on every shard
+
+# one-time dataset setup (needs a Kaggle API token, see above)
+python simulator/build_olist_keyspace.py --num-products 200   # ETL, writes data/olist_records.json
+python simulator/seed_dataset.py                              # writes real product/review/order payloads into Redis
+
 python simulator/load_generator.py --duration 10 --rate 40 --num-keys 50
 ```
 
 `check_cluster.py` should show `OK` for all 5 shards. The load generator
 report shows requests landing across all 5 shards (basic hash placement on
 key, `common/shard_client.py`), plus how many distinct records and co-access
-pairs it collected in the final partial window.
+pairs it collected in the final partial window. Skip the two dataset-setup
+lines (and add `--key-source synthetic`) if you don't have a Kaggle token
+handy yet.
 
 ### Metrics collection (Stage 1)
 
@@ -93,18 +98,19 @@ to `data/last_scenario.json`) recording exactly which records spiked and
 the wall-clock boundary of each phase -- this is the ground truth Stage 4
 will use to label training windows as positive/negative examples. It also
 prints each spike record's per-window access_count series so the rise
-during `spike` and drop-off in `cooldown` are directly visible, e.g.:
+during `spike` and drop-off in `cooldown` are directly visible, e.g.
+(record ids are real Olist product ids by default):
 
 ```
-product:9   1  2  1  21  27  22   2   1
+product:36f60d45225e60c7da4558b070ce4b60   1  1  1  23  26  22  1
 ```
 
 ### Adaptive Heat Index (Stage 3)
 
 ```bash
 python predictor/compute_heat.py --refit-every 10 --min-refit-samples 20
-python predictor/inspect_heat.py --record product:9
-python predictor/plot_heat.py --record product:9 --record product:20
+python predictor/inspect_heat.py --record "product:<a spike record id from the scenario output>"
+python predictor/plot_heat.py --record "product:<id 1>" --record "product:<id 2>"
 ```
 
 Run this right after a scenario (while `data/events.json` still reflects

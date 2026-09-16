@@ -113,7 +113,7 @@ if __name__ == "__main__":
     parser.add_argument("--window-seconds", type=float, default=5.0)
     parser.add_argument("--distribution", choices=["uniform", "zipf"], default="uniform")
     parser.add_argument("--skew", type=float, default=1.2, help="zipf skew parameter (higher = more skewed)")
-    parser.add_argument("--key-source", choices=["synthetic", "olist"], default="synthetic")
+    parser.add_argument("--key-source", choices=["synthetic", "olist"], default="olist")
     args = parser.parse_args()
 
     run(

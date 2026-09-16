@@ -4,13 +4,16 @@ Two sources, same interface, so the Zipf sampler / load generator /
 flash-sale scenario don't care which is in use:
 
   synthetic  - product:i / reviews:i / inventory:i (the original
-               Stage 0-3 scheme, still the default -- nothing about the
-               existing pipeline changes unless --key-source olist is
-               passed explicitly)
+               Stage 0-3 scheme, still available via --key-source
+               synthetic; writes use a plain placeholder payload since
+               there's no "real" content to preserve)
   olist      - real product_ids from the Olist Brazilian E-commerce
-               dataset (see build_olist_keyspace.py). Its third co-access
-               leg is "order" (order volume/freight) rather than
-               "inventory", since Olist has no stock table.
+               dataset (see build_olist_keyspace.py), the default. Its
+               third co-access leg is "order" (order volume/freight)
+               rather than "inventory", since Olist has no stock table.
+               Writes re-serialize the record's real data instead of a
+               random placeholder, so a GET always returns real content
+               even after a write has touched the key.
 """
 
 import json
@@ -20,17 +23,26 @@ DEFAULT_OLIST_PATH = Path(__file__).resolve().parent.parent / "data" / "olist_re
 
 
 class KeySpace:
-    def __init__(self, num_keys, record_id_fn, related_keys_fn, source="synthetic"):
+    def __init__(self, num_keys, record_id_fn, related_keys_fn, source="synthetic", payload_fn=None):
         self.num_keys = num_keys
         self.source = source
         self._record_id_fn = record_id_fn
         self._related_keys_fn = related_keys_fn
+        self._payload_fn = payload_fn
 
     def record_id(self, rank: int) -> str:
         return self._record_id_fn(rank)
 
     def related_keys(self, rank: int):
         return self._related_keys_fn(rank)
+
+    def payload_for(self, key: str, fallback: str) -> str:
+        """Value to write on a SET to `key`. Falls back to `fallback`
+        (a synthetic placeholder) when this key space has no real
+        content for the key -- always true for the synthetic source."""
+        if self._payload_fn is None:
+            return fallback
+        return self._payload_fn(key, fallback)
 
     @classmethod
     def synthetic(cls, num_keys: int) -> "KeySpace":
@@ -53,6 +65,13 @@ class KeySpace:
         if num_keys:
             product_ids = product_ids[:num_keys]
 
+        payloads = {}
+        for pid in product_ids:
+            rec = data["records"][pid]
+            payloads[f"product:{pid}"] = json.dumps(rec["product"])
+            payloads[f"review:{pid}"] = json.dumps(rec["review"])
+            payloads[f"order:{pid}"] = json.dumps(rec["order"])
+
         def record_id(i):
             return f"product:{product_ids[i % len(product_ids)]}"
 
@@ -60,4 +79,13 @@ class KeySpace:
             pid = product_ids[i % len(product_ids)]
             return [f"product:{pid}", f"review:{pid}", f"order:{pid}"]
 
-        return cls(num_keys=len(product_ids), record_id_fn=record_id, related_keys_fn=related_keys, source="olist")
+        def payload_for(key, fallback):
+            return payloads.get(key, fallback)
+
+        return cls(
+            num_keys=len(product_ids),
+            record_id_fn=record_id,
+            related_keys_fn=related_keys,
+            source="olist",
+            payload_fn=payload_for,
+        )

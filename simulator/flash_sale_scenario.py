@@ -69,11 +69,11 @@ def run_phase(collector, key_space, pick_rank, label, duration, rate, write_rati
         if rng.random() < group_ratio:
             keys = key_space.related_keys(pick_rank())
             for key in keys:
-                touch(collector, key, write_ratio, ops)
+                touch(collector, key_space, key, write_ratio, ops)
                 ops += 1
             collector.transaction(keys)
         else:
-            touch(collector, key_space.record_id(pick_rank()), write_ratio, ops)
+            touch(collector, key_space, key_space.record_id(pick_rank()), write_ratio, ops)
             ops += 1
         if interval:
             time.sleep(interval)

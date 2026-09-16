@@ -26,10 +26,10 @@ from common.keyspace import KeySpace  # noqa: E402
 from simulator.zipf import ZipfSampler  # noqa: E402
 
 
-def touch(collector: MetricsCollector, key: str, write_ratio: float, ops: int) -> str:
+def touch(collector: MetricsCollector, key_space: KeySpace, key: str, write_ratio: float, ops: int) -> str:
     shard = collector.cluster.shard_for_key(key)
     if random.random() < write_ratio:
-        collector.set(key, f"payload-{ops}")
+        collector.set(key, key_space.payload_for(key, fallback=f"payload-{ops}"))
     else:
         collector.get(key)
     return shard
@@ -76,13 +76,13 @@ def run(
             i = pick_rank()
             keys = key_space.related_keys(i)
             for key in keys:
-                shard = touch(collector, key, write_ratio, ops)
+                shard = touch(collector, key_space, key, write_ratio, ops)
                 hits[shard] += 1
                 ops += 1
             collector.transaction(keys)
         else:
             key = key_space.record_id(pick_rank())
-            shard = touch(collector, key, write_ratio, ops)
+            shard = touch(collector, key_space, key, write_ratio, ops)
             hits[shard] += 1
             ops += 1
 

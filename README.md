@@ -4,14 +4,17 @@ Predictive hotspot management for distributed e-commerce databases. See
 `METHODOLOGY.md` for the full problem statement, architecture, and evaluation
 design.
 
-## Status: Stage 8 — Dashboard
+## Status: All 9 stages complete
 
-A live, interactive web dashboard (FastAPI + a hand-built HTML/CSS/JS
-frontend, no framework) reuses every stage's own modules directly to
-show the full pipeline running in real time: shard load, per-record
-heat/predictions, the relocation plan, the Stage 7 baseline comparison,
-and the system's own self-tuning -- with controls to launch a flash
-sale and watch it happen live.
+Stage 8 shipped a live, interactive web dashboard (FastAPI + a
+hand-built HTML/CSS/JS frontend, no framework) that reuses every
+stage's own modules directly to show the full pipeline running in real
+time: shard load, per-record heat/predictions, the relocation plan,
+the Stage 7 baseline comparison, and the system's own self-tuning --
+with controls to launch a flash sale and watch it happen live. Stage 9
+is the project report (methodology, per-stage implementation detail,
+all evaluation metrics, limitations, and a viva walkthrough) -- ask the
+maintainer for a copy.
 
 ```
 collector/    # Stage 1: metrics middleware, windowing, event feed, diagnostics

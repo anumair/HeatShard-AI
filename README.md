@@ -185,6 +185,43 @@ of pre-spike windows in a short demo scenario, don't expect a long,
 gradually-rising lead-up -- the real signal is the flag landing on the
 transition window itself rather than several windows into the spike.
 
+#### Honest accuracy numbers (scenario-level held-out evaluation)
+
+"Training accuracy" is a misleading metric here -- positive (spike)
+windows are only ~1% of samples, so a model that never predicts "hot"
+already scores ~99%. `train_xgboost.py --test-db/--test-events` (held
+out from training entirely, never seen) reports real precision/recall
+instead. It's a **scenario-level** split, not a random row split, since
+adjacent windows within one scenario are correlated (decayed features
+carry over) -- a random split would leak information between train and
+test.
+
+`--test-db`/`--test-events` also exposed that plain accuracy AND the
+"textbook" `scale_pos_weight` (the full class-imbalance ratio, ~100x)
+were both misleading: at that weight, held-out precision collapsed to
+3.5% (858 false positives for 31 true positives). Sweeping the weight
+against held-out data found ~20 as the actual best precision/recall
+trade-off (`predictor/train_xgboost.py`'s `DEFAULT_MAX_SCALE_POS_WEIGHT`);
+override with `--scale-pos-weight` if you want a different point on that
+curve.
+
+We also tested whether *more* training data was the bottleneck:
+starting from 22 scenarios of one fixed shape (104 positive samples,
+best held-out F1 ~0.125), `simulator/generate_training_runs.py
+--vary-params` generated 24 more scenarios with randomized spike
+magnitude/bias/num-records/skew (not just a new seed) for 46 total (275
+positive samples). Held-out F1 improved to ~0.147 -- a real but modest
+gain. Conclusion: more diverse data helps somewhat, but isn't the main
+lever left to pull; the harder constraints are the label design (only
+1-2 windows per scenario ever qualify as a "spike" under the
+transition-onset rule) and the small feature set. Worth knowing before
+sinking more time into generating additional scenarios expecting a
+large jump. In practice the deployed ensemble (trend + XGBoost +
+adaptive threshold, not the XGBoost classifier's raw 0.5-cutoff
+predictions) still flagged real spike records correctly in the Stage 4
+and Stage 6 checkpoint runs -- isolated classifier metrics understate
+how the full pipeline behaves.
+
 ### Dependency Graph (Stage 5)
 
 ```bash

@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>HeatShard AI — Live Dashboard</title>
+<link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <div class="brand-mark">HS</div>
+    <div class="brand-text">
+      <h1>HeatShard AI</h1>
+      <p>Predictive hotspot management — live dashboard</p>
+    </div>
+  </div>
+
+  <div class="status-cluster" id="statusCluster">
+    <div class="status-pill" id="pillCluster"><span class="dot"></span>Cluster</div>
+    <div class="status-pill" id="pillScenario"><span class="dot"></span>Scenario</div>
+    <div class="status-pill" id="pillPipeline"><span class="dot"></span>Pipeline</div>
+  </div>
+</header>
+
+<section class="controlbar">
+  <div class="control-group">
+    <label for="seedInput">Seed</label>
+    <input id="seedInput" type="number" placeholder="random" />
+  </div>
+  <div class="control-group">
+    <label for="spikeCountInput">Spike records</label>
+    <input id="spikeCountInput" type="number" value="3" min="1" max="8" />
+  </div>
+  <div class="control-group">
+    <label for="magnitudeInput">Magnitude</label>
+    <input id="magnitudeInput" type="number" value="8" min="2" max="20" step="0.5" />
+  </div>
+  <button id="btnLaunch" class="btn btn-primary">Launch Flash Sale</button>
+  <button id="btnPipeline" class="btn btn-secondary" disabled>Run Prediction &amp; Planning</button>
+  <div class="spacer"></div>
+  <div class="window-info" id="windowInfo">No scenario data yet</div>
+</section>
+
+<section class="phase-track" id="phaseTrack" hidden>
+  <div class="phase-seg" data-phase="baseline"><span>baseline</span></div>
+  <div class="phase-seg" data-phase="pre_spike"><span>pre_spike</span></div>
+  <div class="phase-seg" data-phase="spike"><span>spike</span></div>
+  <div class="phase-seg" data-phase="cooldown"><span>cooldown</span></div>
+  <div class="phase-cursor" id="phaseCursor"></div>
+</section>
+
+<main class="grid">
+
+  <!-- Shard load -->
+  <section class="card card-shard-load">
+    <div class="card-head">
+      <h2>Shard Load</h2>
+      <span class="card-sub">rolling recent window, rolled up by hash placement</span>
+    </div>
+    <div class="chart-wrap chart-wrap-sm"><canvas id="chartShardLoad"></canvas></div>
+  </section>
+
+  <!-- Live log -->
+  <section class="card card-log">
+    <div class="card-head">
+      <h2>Scenario Log</h2>
+      <span class="card-sub" id="logSub">idle</span>
+    </div>
+    <pre class="log-box" id="logBox">Launch a flash sale to see live traffic here.</pre>
+  </section>
+
+  <!-- Records / predictions -->
+  <section class="card card-records">
+    <div class="card-head">
+      <h2>Records — Heat &amp; Predicted Hotspots</h2>
+      <span class="card-sub">latest window · size = access count, color = flagged</span>
+    </div>
+    <div class="records-body">
+      <div class="chart-wrap"><canvas id="chartRecords"></canvas></div>
+      <div class="table-wrap">
+        <table id="tableRecords">
+          <thead>
+            <tr><th>record</th><th>shard</th><th>access</th><th>heat</th><th>P(hot)</th><th>conf</th><th></th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- Relocation plan -->
+  <section class="card card-plan">
+    <div class="card-head">
+      <h2>Relocation Plan</h2>
+      <span class="card-sub" id="planSub">no plan yet</span>
+    </div>
+    <div class="table-wrap">
+      <table id="tablePlan">
+        <thead>
+          <tr><th>record</th><th>from</th><th>to</th><th>EV</th><th>benefit</th><th>cost</th><th>conf</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Dependency graph -->
+  <section class="card card-graph">
+    <div class="card-head">
+      <h2>Dependency Graph</h2>
+      <span class="card-sub" id="graphSub">co-access triangles</span>
+    </div>
+    <div class="graph-wrap">
+      <svg id="depGraph" viewBox="0 0 600 340" preserveAspectRatio="xMidYMid meet"></svg>
+      <div class="graph-tooltip" id="graphTooltip" hidden></div>
+    </div>
+  </section>
+
+  <!-- Evaluation -->
+  <section class="card card-eval">
+    <div class="card-head">
+      <h2>Evaluation — HeatShard vs. Baselines</h2>
+      <span class="card-sub" id="evalSub">static · reactive · heatshard</span>
+    </div>
+    <div class="eval-headline" id="evalHeadline"></div>
+    <div class="eval-charts">
+      <div class="chart-wrap chart-wrap-xs"><canvas id="chartMovement"></canvas></div>
+      <div class="chart-wrap chart-wrap-xs"><canvas id="chartPrecRecall"></canvas></div>
+      <div class="chart-wrap chart-wrap-xs"><canvas id="chartFpRate"></canvas></div>
+      <div class="chart-wrap chart-wrap-xs"><canvas id="chartVariance"></canvas></div>
+    </div>
+  </section>
+
+  <!-- Adaptation -->
+  <section class="card card-adapt">
+    <div class="card-head">
+      <h2>System Self-Tuning</h2>
+      <span class="card-sub">heat-index weights &amp; adaptive confidence threshold over time</span>
+    </div>
+    <div class="adapt-charts">
+      <div class="chart-wrap chart-wrap-sm">
+        <canvas id="chartWeights"></canvas>
+        <div class="empty-msg chart-empty" id="emptyWeights" hidden>Not enough windows yet for a weight refit (needs --refit-every, default 10 in this demo).</div>
+      </div>
+      <div class="chart-wrap chart-wrap-sm">
+        <canvas id="chartThreshold"></canvas>
+        <div class="empty-msg chart-empty" id="emptyThreshold" hidden>No flagged predictions have resolved an outcome yet.</div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="footer">
+  HeatShard AI · Stage 8 dashboard · reads live from the same SQLite pipeline as every CLI stage
+</footer>
+
+<script src="/static/vendor/chart.umd.min.js"></script>
+<script src="/static/js/app.js"></script>
+</body>
+</html>

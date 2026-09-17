@@ -4,19 +4,20 @@ Predictive hotspot management for distributed e-commerce databases. See
 `METHODOLOGY.md` for the full problem statement, architecture, and evaluation
 design.
 
-## Status: Stage 7 — Baselines & Benchmarking
+## Status: Stage 8 — Dashboard
 
-Static sharding and reactive threshold-based baselines are implemented
-alongside HeatShard, with an evaluation harness computing the
-methodology's defined metrics (data movement, precision, recall,
-false-positive rate, load variance) and comparison charts -- this is
-the project's Results section.
+A live, interactive web dashboard (FastAPI + a hand-built HTML/CSS/JS
+frontend, no framework) reuses every stage's own modules directly to
+show the full pipeline running in real time: shard load, per-record
+heat/predictions, the relocation plan, the Stage 7 baseline comparison,
+and the system's own self-tuning -- with controls to launch a flash
+sale and watch it happen live.
 
 ```
 collector/    # Stage 1: metrics middleware, windowing, event feed, diagnostics
 predictor/    # Stage 3: adaptive heat index. Stage 4: trend + XGBoost prediction engine
 planner/      # Stage 5: dependency graph. Stage 6: relocation planner. Stage 7: baselines + evaluate.py
-dashboard/    # Stage 8: visual demo
+dashboard/    # Stage 8: server.py (FastAPI) + static/ (frontend) -- the live visual demo
 simulator/    # load generator (uniform/zipf) + flash_sale_scenario.py (Stage 2) + generate_training_runs.py (Stage 4)
 common/       # shared config and shard client used by every component
 data/         # events.json (checked in, illustrative) + generated *.db/scenarios/*.png/olist_records.json/training_runs/xgb_model.json (gitignored)
@@ -360,6 +361,44 @@ section:
    more placement-friendly one. Worth flagging in the report's
    limitations section (Stage 9) alongside decision-support scope and
    cross-shard join tradeoffs.
+
+### Dashboard (Stage 8)
+
+```bash
+python -m uvicorn dashboard.server:app --host 127.0.0.1 --port 8420
+# open http://127.0.0.1:8420
+```
+
+A single-page dashboard (`dashboard/server.py` + `dashboard/static/`) that reuses
+every stage's modules directly -- `ShardCluster`, `DependencyGraph`,
+`compute_plan`, `reactive_plan`, `evaluate_system`, etc. -- rather than
+reimplementing any of their logic. Panels:
+
+- **Shard load** and a **live scenario log** (streams a running
+  `flash_sale_scenario.py` subprocess in real time)
+- **Records** -- a heat/prediction scatter plus table, flagged hotspots highlighted
+- **Relocation plan** -- the current plan's moves with cost/benefit/EV
+- **Dependency graph** -- the Stage 5 co-access triangles, rendered as an
+  interactive SVG (hover a node for its id)
+- **Evaluation** -- the Stage 7 static/reactive/HeatShard comparison,
+  including the lead-time headline stat, recomputed live
+- **System self-tuning** -- the heat index's weight-refit history and the
+  adaptive confidence threshold over time, with a clear empty-state
+  message when a scenario hasn't produced enough windows to trigger either
+  yet (rather than a blank chart)
+
+**Controls:** "Launch Flash Sale" starts a real scenario as a background
+process (the DB resets to a clean slate first) and the dashboard polls
+its live output and shard load while it runs -- the phase timeline at
+the top tracks baseline/pre_spike/spike/cooldown with a live cursor,
+using a manifest written with *planned* phase boundaries the moment the
+scenario starts (the accurate, as-observed manifest overwrites it once
+the run finishes). "Run Prediction & Planning" runs
+`compute_heat.py` + `run_prediction.py` + `run_relocation.py` against
+whatever was just recorded.
+
+Chart.js is vendored locally (`dashboard/static/vendor/`) rather than
+loaded from a CDN, so the dashboard works offline during a demo.
 
 ### Stop it
 

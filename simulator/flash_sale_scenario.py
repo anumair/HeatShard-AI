@@ -122,6 +122,26 @@ def run(cfg: ScenarioConfig, db_path=None, events_path=None):
     phases = []
 
     t0 = time.time()
+    # Write a preliminary manifest with *planned* phase boundaries before any
+    # phase runs, so a live viewer (e.g. the Stage 8 dashboard) can show
+    # progress through a running scenario -- the real manifest below, with
+    # actually-observed boundaries, overwrites this once the run completes.
+    cursor = t0
+    planned_phases = []
+    for name, duration in (
+        ("baseline", cfg.baseline_seconds),
+        ("pre_spike", cfg.lead_seconds),
+        ("spike", cfg.spike_seconds),
+        ("cooldown", cfg.cooldown_seconds),
+    ):
+        planned_phases.append({"name": name, "start": cursor, "end": cursor + duration})
+        cursor += duration
+    with open(LAST_SCENARIO_PATH, "w") as f:
+        json.dump(
+            {"config": asdict(cfg), "spike_records": spike_records, "phases": planned_phases, "in_progress": True},
+            f, indent=2,
+        )
+
     ops_baseline = run_phase(collector, key_space, normal_pick, "baseline", cfg.baseline_seconds, cfg.rate, cfg.write_ratio, cfg.group_ratio, rng)
     t1 = time.time()
     phases.append({"name": "baseline", "start": t0, "end": t1, "ops": ops_baseline})
@@ -171,6 +191,7 @@ def run(cfg: ScenarioConfig, db_path=None, events_path=None):
         "event_registered_at": event_registered_at,
         "phases": phases,
         "db_path": str(collector.db_path),
+        "in_progress": False,
     }
 
     SCENARIOS_DIR.mkdir(parents=True, exist_ok=True)

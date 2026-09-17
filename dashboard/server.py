@@ -46,18 +46,20 @@ app = FastAPI(title="HeatShard AI Dashboard")
 def ensure_full_schema():
     """Every stage's tables (metric_windows, heat_windows, predictions,
     relocation_plans, ...) live in one shared db file, but each stage's
-    own init_db() only runs when its CLI script does. A fresh scenario
-    creates just the collector's tables, so any endpoint touching a later
-    stage's table would 500 with "no such table" until the pipeline has
-    run once. Call this right after the db file is (re)created so the
-    full schema exists from the first moment, even empty."""
+    own init_db() only runs when its CLI script does. Worse, sqlite3
+    silently creates an empty stub file the instant anything connects to
+    a missing path -- so even a guard like "only run this if the file
+    exists" is unsafe, since some other endpoint's plain connect() can
+    have already created an empty, schema-less file first. Always call
+    this unconditionally (CREATE TABLE IF NOT EXISTS makes it cheap and
+    idempotent either way) so the full schema exists before any request
+    is served, no matter what state the file was in."""
     collector_storage.init_db(DEFAULT_DB_PATH)
     heat_storage.init_db(DEFAULT_DB_PATH)
     planner_storage.init_db(DEFAULT_DB_PATH)
 
 
-if DEFAULT_DB_PATH.exists():
-    ensure_full_schema()
+ensure_full_schema()
 
 
 # ---------------------------------------------------------------------------

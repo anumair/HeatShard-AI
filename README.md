@@ -4,17 +4,18 @@ Predictive hotspot management for distributed e-commerce databases. See
 `METHODOLOGY.md` for the full problem statement, architecture, and evaluation
 design.
 
-## Status: Stage 5 — Partition Heat Maps & Dependency Graph
+## Status: Stage 6 — Intelligent Relocation Planner
 
-Component 4 is implemented: a sparse dependency graph built straight
-from Component 1's co-access counters, with a query interface (given a
-record, return its neighbors) that Stage 6's Relocation Planner will use
-to avoid separating related records across shards.
+Component 5 is implemented -- the project's core novel contribution:
+predictions + the dependency graph + current shard load turn into a
+concrete, cost-justified relocation plan, with a naive whole-shard
+baseline for comparison and outcome tracking that feeds back into
+Stage 4's adaptive confidence threshold.
 
 ```
 collector/    # Stage 1: metrics middleware, windowing, event feed, diagnostics
 predictor/    # Stage 3: adaptive heat index. Stage 4: trend + XGBoost prediction engine
-planner/      # Stage 5: dependency graph (Stage 6 relocation planner still to come)
+planner/      # Stage 5: dependency graph. Stage 6: relocation planner + naive baseline
 dashboard/    # Stage 8: visual demo
 simulator/    # load generator (uniform/zipf) + flash_sale_scenario.py (Stage 2) + generate_training_runs.py (Stage 4)
 common/       # shared config and shard client used by every component
@@ -206,6 +207,61 @@ triple, the resulting graph should be a set of fully disjoint triangles
 a 30-record run produced exactly 10 isolated triangles (30 edges, 10
 connected components), and raising `--min-co-access` from 3 to 15 dropped
 weakly-supported edges as expected (10 components -> 4).
+
+### Relocation Planner (Stage 6)
+
+```bash
+python planner/run_relocation.py                              # plan from the earliest actionable window
+python planner/run_relocation.py --window-start <ts> --min-probability 0.5   # target a specific window
+python planner/check_outcomes.py                               # resolve outcomes, feed Stage 4's adaptive threshold
+```
+
+Run this after `predictor/run_prediction.py` has populated the
+`predictions` table for the scenario. `planner/relocation_planner.py`
+implements the methodology's formula for each candidate record *i* and
+destination shard *j*:
+
+```
+ExpectedValue(i, j) = P(hotspot_i) * Benefit(i, j)
+                     - RelocationCost(i, j)
+                     - (1 - P(hotspot_i)) * WastedCost(i, j)
+                     - CrossShardPenalty(i, j)
+```
+
+`Benefit(i, j)` is the reduction in cluster load variance a hypothetical
+move would produce, so "destination chosen to minimize resulting load
+variance" falls directly out of the formula. `CrossShardPenalty` queries
+Stage 5's dependency graph -- moving a record away from shards holding
+its co-accessed neighbors costs more. Only positive-EV moves make the
+plan; exact optimal assignment is NP-hard, so a greedy heuristic picks
+the single best (candidate, destination) pair by EV, applies it, and
+recomputes every remaining candidate against the updated shard loads
+and placement before picking the next move.
+
+`run_relocation.py` also runs the **headline Stage 6 checkpoint**: a
+naive whole-shard-migration baseline (move everything on any shard that
+hosts a predicted hotspot) for comparison. On a real flash-sale run:
+
+```
+HeatShard (targeted):  5 record(s) relocated
+Naive (whole-shard):   116 record(s) relocated (4 shards fully migrated)
+reduction: 95.7% less data movement than the naive baseline
+```
+
+The plan correctly included the scenario's actual flash-sale record
+(planned in the last pre-spike window, before the spike hit) and kept a
+product's `review`/`order` counterparts co-located rather than splitting
+them across shards -- the dependency graph's cross-shard penalty working
+as intended.
+
+`check_outcomes.py` closes the loop: for every planned move, it checks
+whether the record actually went hot in the following window (reusing
+`HeatIndex`'s own spike rule) and feeds that outcome into a fresh
+`AdaptiveThreshold`. In one real run, 9 of 10 relocated records turned
+out to be false positives (from noisy early-window candidates) and only
+the genuine flash-sale record was correctly hot -- that low precision
+pushed the threshold up from 0.60 to 0.65, exactly the self-correcting
+behavior the methodology calls for.
 
 ### Stop it
 

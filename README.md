@@ -4,18 +4,18 @@ Predictive hotspot management for distributed e-commerce databases. See
 `METHODOLOGY.md` for the full problem statement, architecture, and evaluation
 design.
 
-## Status: Stage 6 — Intelligent Relocation Planner
+## Status: Stage 7 — Baselines & Benchmarking
 
-Component 5 is implemented -- the project's core novel contribution:
-predictions + the dependency graph + current shard load turn into a
-concrete, cost-justified relocation plan, with a naive whole-shard
-baseline for comparison and outcome tracking that feeds back into
-Stage 4's adaptive confidence threshold.
+Static sharding and reactive threshold-based baselines are implemented
+alongside HeatShard, with an evaluation harness computing the
+methodology's defined metrics (data movement, precision, recall,
+false-positive rate, load variance) and comparison charts -- this is
+the project's Results section.
 
 ```
 collector/    # Stage 1: metrics middleware, windowing, event feed, diagnostics
 predictor/    # Stage 3: adaptive heat index. Stage 4: trend + XGBoost prediction engine
-planner/      # Stage 5: dependency graph. Stage 6: relocation planner + naive baseline
+planner/      # Stage 5: dependency graph. Stage 6: relocation planner. Stage 7: baselines + evaluate.py
 dashboard/    # Stage 8: visual demo
 simulator/    # load generator (uniform/zipf) + flash_sale_scenario.py (Stage 2) + generate_training_runs.py (Stage 4)
 common/       # shared config and shard client used by every component
@@ -299,6 +299,67 @@ out to be false positives (from noisy early-window candidates) and only
 the genuine flash-sale record was correctly hot -- that low precision
 pushed the threshold up from 0.60 to 0.65, exactly the self-correcting
 behavior the methodology calls for.
+
+### Baselines & Benchmarking (Stage 7)
+
+```bash
+python planner/evaluate.py --min-probability 0.5
+```
+
+Run after `predictor/run_prediction.py`. Implements the two comparison
+systems from the methodology (Section 4.2) and evaluates all three
+against the same recorded scenario:
+
+- **static** -- no rebalancing, ever
+- **reactive** (`planner/reactive_baseline.py`) -- migrates an entire
+  shard once its *observed* rolling load crosses a fixed multiple of
+  the cluster average (default 1.5x). No predictions, no per-record
+  targeting -- purely reactive, and can only ever act once a shard is
+  already overloaded.
+- **heatshard** -- Stage 6's plan, evaluated at its own natural decision
+  point (the earliest window with an actionable prediction)
+
+Each system is judged at *its own* natural decision point rather than
+one shared snapshot -- reactive scans the scenario chronologically for
+the first window where load actually crosses the threshold, which is
+later than HeatShard's proactive trigger by design. Ground truth ("did
+a record actually become hot") reuses `HeatIndex`'s own spike rule,
+scanned across the whole scenario. `evaluate.py` prints a results table
+and renders `data/evaluation.png` with the methodology's five defined
+metrics (Section 4.3): data movement, precision, recall, false-positive
+rate, and load variance before/after.
+
+A representative run:
+
+```
+system         moved  precision   recall   FP rate  var before  var after
+static             0       0.00     0.00      0.00        1370       1370
+reactive          18       0.06     0.11      0.94        1457       3089
+heatshard          1       1.00     0.11      0.00        1370        580
+
+HeatShard acted 12s earlier than the reactive baseline would have noticed anything
+```
+
+Two findings stood out and are worth keeping for the report's Results
+section:
+
+1. **The reactive baseline's blind "migrate everything to the
+   least-loaded shard" strategy makes load variance *worse*, not
+   better** (1457 -> 3089) -- dumping an entire overloaded shard onto a
+   single destination just creates a new hotspot there. HeatShard's
+   variance-aware placement (Benefit = actual variance reduction) cuts
+   variance by more than half using 18x less data movement.
+2. **Precision/recall vary meaningfully run to run**, and one honest
+   edge case is worth documenting rather than hiding: a genuine
+   ground-truth spike record can have too large an individual load to
+   fit any single destination shard without overshooting and making
+   variance worse, in which case the planner (correctly, by its own
+   ExpectedValue logic) declines to move it -- it isn't a bug, but it
+   does mean the current single-destination-per-record design
+   sometimes passes over the "obvious" candidate in favor of a smaller,
+   more placement-friendly one. Worth flagging in the report's
+   limitations section (Stage 9) alongside decision-support scope and
+   cross-shard join tradeoffs.
 
 ### Stop it
 

@@ -365,6 +365,48 @@ section:
    limitations section (Stage 9) alongside decision-support scope and
    cross-shard join tradeoffs.
 
+**The single-run numbers above are illustrative of the mechanism, not
+the headline result** -- a single scenario's precision/recall/lead-time
+turned out to vary hugely by seed. `planner/evaluate_aggregate.py` runs
+N independent scenarios and reports mean +/- std instead:
+
+```bash
+python planner/evaluate_aggregate.py --num-runs 15 --seed-start 5000
+```
+
+Real result over 15 runs (never used in training):
+
+```
+system       metric                     mean        std
+reactive     data_movement             13.73       3.96
+heatshard    data_movement              2.73       1.48
+reactive     precision                  0.09       0.07
+heatshard    precision                  0.27       0.27
+reactive     recall                     0.31       0.25
+heatshard    recall                     0.19       0.16
+reactive     false_positive_rate        0.91       0.07
+heatshard    false_positive_rate        0.66       0.31
+static/heatshard  variance before    2270.04
+reactive          variance before     275.27
+static            variance after     2270.04  (unchanged, as expected)
+reactive           variance after     684.10   (worse than before)
+heatshard           variance after   1006.02   (-56% vs before)
+
+HeatShard lead time over reactive: mean=2.2s std=4.6s (n=15/15)
+```
+
+What actually holds up: HeatShard reduces load variance by ~56% on
+average while moving ~5x less data than reactive; reactive's blind
+strategy makes variance *worse* on average, not just in one run. What
+doesn't hold up: the 21s lead-time and precision-up-to-100% numbers
+above were an outlier run, not typical -- the real average lead time is
+2.2s with a *larger* standard deviation than the mean, and precision
+ranges from 0 to 1.0 by seed with no stable operating point. One
+number the single-run framing hid entirely: reactive's average recall
+(0.31) is higher than HeatShard's (0.19) -- the blunt approach catches
+more genuinely-hot records on average, just far more wastefully. Report
+the aggregated numbers, not a cherry-picked run, in the Results section.
+
 ### Dashboard (Stage 8)
 
 ```bash

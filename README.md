@@ -4,17 +4,17 @@ Predictive hotspot management for distributed e-commerce databases. See
 `METHODOLOGY.md` for the full problem statement, architecture, and evaluation
 design.
 
-## Status: Stage 4 — Hybrid Prediction Engine
+## Status: Stage 5 — Partition Heat Maps & Dependency Graph
 
-Component 3 is implemented: a trend sub-model + a trained XGBoost
-sub-model are combined into P(hotspot in next window) + a confidence
-score per record, gated through an adaptive confidence threshold that
-tunes itself against its own recent track record.
+Component 4 is implemented: a sparse dependency graph built straight
+from Component 1's co-access counters, with a query interface (given a
+record, return its neighbors) that Stage 6's Relocation Planner will use
+to avoid separating related records across shards.
 
 ```
 collector/    # Stage 1: metrics middleware, windowing, event feed, diagnostics
 predictor/    # Stage 3: adaptive heat index. Stage 4: trend + XGBoost prediction engine
-planner/      # Stage 5-6: dependency graph + relocation planner
+planner/      # Stage 5: dependency graph (Stage 6 relocation planner still to come)
 dashboard/    # Stage 8: visual demo
 simulator/    # load generator (uniform/zipf) + flash_sale_scenario.py (Stage 2) + generate_training_runs.py (Stage 4)
 common/       # shared config and shard client used by every component
@@ -183,6 +183,29 @@ it's a genuinely proactive flag, not a reactive one. With only a handful
 of pre-spike windows in a short demo scenario, don't expect a long,
 gradually-rising lead-up -- the real signal is the flag landing on the
 transition window itself rather than several windows into the spike.
+
+### Dependency Graph (Stage 5)
+
+```bash
+python planner/inspect_graph.py                              # graph summary + most-connected records
+python planner/inspect_graph.py --record "product:<some id>"  # given a record, return its neighbors
+python planner/plot_graph.py                                  # PNG sanity check (data/dependency_graph.png)
+```
+
+`planner/dependency_graph.py` builds the graph directly from Component
+1's `co_access_windows` table: aggregates every recorded pair's count
+across all windows, drops pairs below `--min-co-access` (default 3) to
+keep it sparse, and exposes `neighbors(record_id)`, `has_edge(a, b)`,
+and `edge_weight(a, b)` for Stage 6's Relocation Planner to query when
+computing its cross-shard penalty.
+
+The sanity check: since the simulator only ever calls
+`collector.transaction(...)` on a product's own product/review/order
+triple, the resulting graph should be a set of fully disjoint triangles
+-- one per product, no cross-links between unrelated products. Verified:
+a 30-record run produced exactly 10 isolated triangles (30 edges, 10
+connected components), and raising `--min-co-access` from 3 to 15 dropped
+weakly-supported edges as expected (10 components -> 4).
 
 ### Stop it
 

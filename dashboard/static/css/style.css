@@ -27,6 +27,11 @@
 
 * { box-sizing: border-box; }
 
+/* [hidden] has the same CSS specificity as a class selector, so a later
+   class rule (e.g. .chart-empty { display: flex }) can silently win the
+   cascade and defeat el.hidden = true. Force it explicitly. */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   padding: 0;

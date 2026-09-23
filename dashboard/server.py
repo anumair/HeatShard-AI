@@ -62,6 +62,21 @@ def ensure_full_schema():
 ensure_full_schema()
 
 
+@app.middleware("http")
+async def ensure_schema_before_every_request(request, call_next):
+    """The one-time call above only covers the file's state at server
+    startup. This project's whole workflow involves deleting
+    data/metrics.db directly (a plain `rm`) to reset between demos --
+    that bypasses both of the in-app reset paths (startup and
+    ScenarioRun.start()) entirely, and the next request would recreate an
+    empty, schema-less stub via sqlite3's auto-create-on-connect and 500.
+    Reasserting the schema on every request (cheap: CREATE TABLE IF NOT
+    EXISTS, sub-millisecond) is the only way to be robust against the db
+    file being deleted by anything outside this process."""
+    ensure_full_schema()
+    return await call_next(request)
+
+
 # ---------------------------------------------------------------------------
 # Background scenario runner: flash_sale_scenario.py runs in real time
 # (rate-limited traffic, ~30-60s), so it's launched as a subprocess and

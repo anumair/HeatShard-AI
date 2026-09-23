@@ -491,20 +491,24 @@ async function refreshAdaptation() {
   if (weightData.history.length) {
     const featureNames = Object.keys(weightData.history[0].weights);
     const palette = ["#60a5fa", "#a78bfa", "#34d399", "#fbbf24", "#f472b6", "#22d3ee", "#f97316"];
+    // Bar, not line: with only one or two refits (typical for a short demo
+    // scenario -- refits need --refit-every windows, default 10), a line
+    // chart just draws isolated dots, and several weights routinely
+    // collapse to exactly 0 after clip+renormalize, so multiple dots stack
+    // invisibly on the same point. Grouped bars stay legible at any refit
+    // count, including one.
     ensureChart("chartWeights", {
-      type: "line",
+      type: "bar",
       data: {
         labels: weightData.history.map((h) => `w${h.window_index}`),
         datasets: featureNames.map((name, i) => ({
           label: name,
           data: weightData.history.map((h) => h.weights[name]),
-          borderColor: palette[i % palette.length],
-          backgroundColor: "transparent",
-          tension: 0.3,
-          pointRadius: 2,
+          backgroundColor: palette[i % palette.length],
+          borderRadius: 3,
         })),
       },
-      options: chartOptions("heat index weights over refits"),
+      options: chartOptions("heat index weights over refits", 1),
     });
   }
 

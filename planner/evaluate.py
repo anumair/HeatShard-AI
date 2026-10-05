@@ -48,6 +48,7 @@ from collector.storage import DEFAULT_DB_PATH  # noqa: E402
 from common.shard_client import ShardCluster  # noqa: E402
 from planner.reactive_baseline import DEFAULT_THRESHOLD_MULTIPLIER, reactive_plan  # noqa: E402
 from planner.run_relocation import MIN_CANDIDATE_PROBABILITY, compute_plan  # noqa: E402
+from planner.shard_load import record_load_at_window, shard_loads  # noqa: E402
 from predictor.labels import hot_windows  # noqa: E402
 
 DEFAULT_OUT_PATH = Path(__file__).resolve().parent.parent / "data" / "evaluation.png"
@@ -88,30 +89,10 @@ def first_hot_window_start(db_path):
 def load_at_window(db_path, up_to_window_start, cluster, window_lookback=5):
     """Per-shard/per-record load rolled up over the `window_lookback`
     windows ending at (and including) `up_to_window_start`."""
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    windows = [
-        r["window_start"]
-        for r in conn.execute(
-            "SELECT DISTINCT window_start FROM metric_windows WHERE window_start <= ? ORDER BY window_start DESC LIMIT ?",
-            (up_to_window_start, window_lookback),
-        ).fetchall()
-    ]
-    if not windows:
-        conn.close()
+    record_load = record_load_at_window(db_path, up_to_window_start, window_lookback)
+    if not record_load:
         return {}, {}
-    placeholders = ",".join("?" * len(windows))
-    rows = conn.execute(
-        f"SELECT record_id, SUM(access_count) as total FROM metric_windows WHERE window_start IN ({placeholders}) GROUP BY record_id",
-        windows,
-    ).fetchall()
-    conn.close()
-
-    record_load = {r["record_id"]: float(r["total"]) for r in rows}
-    shard_load = {name: 0.0 for name in cluster.shard_names()}
-    for record_id, load in record_load.items():
-        shard_load[cluster.shard_for_key(record_id)] += load
-    return shard_load, record_load
+    return shard_loads(record_load, cluster), record_load
 
 
 def find_reactive_trigger(db_path, cluster, threshold_multiplier, window_lookback=5):
@@ -251,7 +232,10 @@ def main():
     if reactive_window is not None:
         lead_time = reactive_window - heatshard_window
         print(f"reactive threshold first crossed at window_start={reactive_window}")
-        print(f"HeatShard acted {lead_time:.0f}s earlier than the reactive baseline would have noticed anything")
+        if lead_time >= 0:
+            print(f"HeatShard acted {lead_time:.0f}s before the reactive baseline would have noticed anything")
+        else:
+            print(f"the reactive baseline's threshold fired {-lead_time:.0f}s BEFORE HeatShard's first actionable prediction")
     else:
         print("reactive threshold never crossed in this scenario -- it would have done nothing at all")
 

@@ -395,16 +395,16 @@ Result over 15 never-trained-on scenarios (mean +/- std):
 
 | metric | static | reactive | **HeatShard** |
 |---|---|---|---|
-| records moved | 0 | 22.9 +/- 9.9 | **2.3 +/- 1.4** |
+| records moved | 0 | 22.9 +/- 9.9 | **1.8 +/- 0.9** |
 | precision | -- | 0.05 +/- 0.04 | **0.93 +/- 0.25** |
-| recall | -- | 0.20 +/- 0.18 | **0.38 +/- 0.19** |
+| recall | -- | 0.20 +/- 0.18 | **0.30 +/- 0.15** |
 | false-positive rate | -- | 0.89 +/- 0.24 | **0.00** |
-| load variance, at decision time (before -> after) | 2620 | 3636 -> 8428 (**worse**) | 2620 -> 1246 (**-52%**) |
-| load variance, at the load peak (before -> after) | 6869 | 6869 -> 10938 (**+59%**) | 6869 -> 5117 (**-26%**) |
+| load variance, at decision time (before -> after) | 3364 | 3786 -> 8578 (**worse**) | 3364 -> 2128 (**-37%**) |
+| load variance, at the load peak (before -> after) | 6869 | 6869 -> 10938 (**+59%**) | 6869 -> 4362 (**-36%**) |
 
 What holds up:
 
-- **~10x less data movement** than reactive, with near-perfect precision
+- **~13x less data movement** than reactive (1.8 vs 22.9 records), with near-perfect precision
   and zero false-positive relocations.
 - **Reactive's blind "migrate the whole shard to the least-loaded shard"
   makes balance worse, not better**, on average -- it dumps an entire shard
@@ -414,12 +414,12 @@ What holds up:
 
 What does not hold up, stated plainly:
 
-- **The balance benefit at the load peak is modest and uneven.** Variance
-  at the peak drops in only 9 of 15 runs; the per-run median reduction is
-  ~5% (mean 16%). The pooled -26% in the table is dominated by the few
-  high-variance scenarios where a relocated record mattered most, so
-  quote it with that caveat. The decision-time -52% flatters the system.
-- **Recall is low (0.38).** HeatShard moves ~2 records per scenario while
+- **The balance benefit at the load peak is real but uneven.** Variance
+  at the peak drops in 10 of 15 runs (the other 5 are unchanged or
+  slightly worse); the per-run median reduction is ~27% (mean 30%). The
+  pooled -36% in the table is weighted toward the high-variance
+  scenarios, so quote the per-run median alongside it.
+- **Recall is low (0.30).** HeatShard moves ~2 records per scenario while
   ~6 become hot. Some are unannounced surprise spikes nothing can predict
   early; the planner also declines moves whose expected value is not
   positive, and relocates each record to a single destination only.
@@ -435,11 +435,19 @@ What does not hold up, stated plainly:
   anything.
 - Precision is bimodal: 1.0 in 14 runs, 0.0 in the run with no moves.
 
+**Planner fix found during the final regression check.** `compute_plan()`
+used to size every candidate's load from the *last* windows of the whole
+recording rather than the decision window. A record flagged before its spike
+looked tiny (no benefit, no move), and in short scenarios post-decision spike
+load leaked back into the plan. It now reads load as of the decision window
+and sizes a predicted-hot record at no less than the hot-level load
+(`HOT_MIN_QPS` over the lookback). The table above is after that fix.
+
 Sensitivity of the planner's candidate-probability floor (picked on 16
 *validation* scenarios, `planner/sweep_probability_floor.py`, not on the
 15 above): lowering it makes HeatShard act earlier but worse -- at 0.15 it
 acts before the first hot window in 12/16 runs but peak-variance
-reduction falls from 54% to 45% and precision from 0.88 to 0.77, and at
+reduction falls from 42% to 36% and precision from 0.81 to 0.72, and at
 0.05 it collapses (precision 0.12). 0.3 was best on every balance metric,
 so it stays the default.
 

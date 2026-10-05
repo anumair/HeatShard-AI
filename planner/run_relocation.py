@@ -27,7 +27,8 @@ from planner import storage as planner_storage  # noqa: E402
 from planner.baseline import whole_shard_migration_volume  # noqa: E402
 from planner.dependency_graph import DependencyGraph  # noqa: E402
 from planner.relocation_planner import RelocationCandidate, RelocationPlanner  # noqa: E402
-from planner.shard_load import record_recent_load, shard_loads  # noqa: E402
+from planner.shard_load import record_load_at_window, shard_loads, window_seconds_of  # noqa: E402
+from predictor.labels import HOT_MIN_QPS  # noqa: E402
 
 MIN_CANDIDATE_PROBABILITY = 0.3  # floor for even considering a record; ExpectedValue does the real filtering
 
@@ -53,12 +54,21 @@ def compute_plan(
     cluster, graph -- or None if no window has an actionable prediction."""
     cluster = cluster or ShardCluster()
     graph = DependencyGraph.build(db_path, min_co_access=min_co_access)
-    record_load = record_recent_load(db_path, window_lookback=window_lookback)
-    loads = shard_loads(record_load, cluster)
 
     window_start = window_start or pick_target_window(db_path, min_probability)
     if window_start is None:
         return None
+
+    # Load is judged as of the decision window, never from later windows: an
+    # earlier version read the last windows of the whole recording, which both
+    # hid a record's coming spike (flagged before it surged -> tiny load -> no
+    # benefit -> no move) and, in short scenarios, leaked post-decision spike
+    # load back into the plan.
+    record_load = record_load_at_window(db_path, window_start, window_lookback=window_lookback)
+    loads = shard_loads(record_load, cluster)
+    # A record predicted hot will carry at least the hot-level load (labels.py:
+    # HOT_MIN_QPS over the lookback span), even if it has barely been touched yet.
+    hot_floor = HOT_MIN_QPS * (window_seconds_of(db_path) or 1.0) * window_lookback
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -74,7 +84,7 @@ def compute_plan(
             source_shard=cluster.shard_for_key(row["record_id"]),
             p_hotspot=row["p_ensemble"],
             confidence=row["confidence"],
-            predicted_load=record_load.get(row["record_id"], 1.0),
+            predicted_load=max(record_load.get(row["record_id"], 0.0), hot_floor),
         )
         for row in prediction_rows
     ]

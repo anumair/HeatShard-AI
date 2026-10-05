@@ -58,8 +58,11 @@ def main():
     xgb_model = None
     model_path = Path(args.model)
     if model_path.exists():
-        xgb_model = XGBHotspotModel.load(model_path)
-        print(f"loaded XGBoost model from {model_path}")
+        try:
+            xgb_model = XGBHotspotModel.load(model_path)
+            print(f"loaded XGBoost model from {model_path}")
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"could not use the XGBoost model at {model_path} ({exc}) -- running trend-only")
     else:
         print(f"no XGBoost model at {model_path} -- running trend-only (train one with predictor/train_xgboost.py)")
 

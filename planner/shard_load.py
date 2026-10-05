@@ -37,6 +37,40 @@ def record_recent_load(db_path=None, window_lookback: int = 5) -> dict:
     return {r["record_id"]: float(r["total"]) for r in rows}
 
 
+def record_load_at_window(db_path, up_to_window_start: float, window_lookback: int = 5) -> dict:
+    """{record_id: total_access_count} over the `window_lookback` windows
+    ending at (and including) `up_to_window_start` -- the load a planner
+    could actually have observed at that decision moment, with nothing
+    from later windows."""
+    conn = sqlite3.connect(db_path or DEFAULT_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    windows = [
+        r["window_start"]
+        for r in conn.execute(
+            "SELECT DISTINCT window_start FROM metric_windows WHERE window_start <= ? ORDER BY window_start DESC LIMIT ?",
+            (up_to_window_start, window_lookback),
+        ).fetchall()
+    ]
+    if not windows:
+        conn.close()
+        return {}
+    placeholders = ",".join("?" * len(windows))
+    rows = conn.execute(
+        f"SELECT record_id, SUM(access_count) as total FROM metric_windows WHERE window_start IN ({placeholders}) GROUP BY record_id",
+        windows,
+    ).fetchall()
+    conn.close()
+    return {r["record_id"]: float(r["total"]) for r in rows}
+
+
+def window_seconds_of(db_path) -> float:
+    """Typical window length in the recorded scenario."""
+    conn = sqlite3.connect(db_path or DEFAULT_DB_PATH)
+    row = conn.execute("SELECT window_end - window_start FROM metric_windows LIMIT 1").fetchone()
+    conn.close()
+    return float(row[0]) if row else 0.0
+
+
 def shard_loads(record_load: dict, cluster: ShardCluster = None) -> dict:
     """Roll up per-record load to each record's current (hash-based) home shard."""
     cluster = cluster or ShardCluster()

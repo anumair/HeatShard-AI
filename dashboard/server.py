@@ -31,7 +31,7 @@ import predictor.storage as heat_storage  # noqa: E402
 from collector.storage import DEFAULT_DB_PATH  # noqa: E402
 from common.shard_client import ShardCluster  # noqa: E402
 from planner.dependency_graph import DEFAULT_MIN_CO_ACCESS, DependencyGraph  # noqa: E402
-from planner.evaluate import evaluate_system, ever_hot_records, find_reactive_trigger  # noqa: E402
+from planner.evaluate import evaluate_system, ever_hot_records, find_reactive_trigger, first_hot_window_start  # noqa: E402
 from planner.reactive_baseline import DEFAULT_THRESHOLD_MULTIPLIER, reactive_plan  # noqa: E402
 from planner.run_relocation import MIN_CANDIDATE_PROBABILITY, compute_plan  # noqa: E402
 from planner.shard_load import record_recent_load, shard_loads  # noqa: E402
@@ -233,20 +233,21 @@ def get_records(limit: int = 300):
 @app.get("/api/relocation-plan")
 def get_relocation_plan():
     if not DEFAULT_DB_PATH.exists():
-        return {"moves": [], "window_start": None}
+        return {"moves": [], "window_start": None, "predictions_ready": False}
     conn = sqlite3.connect(DEFAULT_DB_PATH)
     conn.row_factory = sqlite3.Row
+    predictions_ready = conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0] > 0
     latest_created = conn.execute("SELECT MAX(created_at) FROM relocation_plans").fetchone()[0]
     if latest_created is None:
         conn.close()
-        return {"moves": [], "window_start": None}
+        return {"moves": [], "window_start": None, "predictions_ready": predictions_ready}
     rows = conn.execute(
         "SELECT * FROM relocation_plans WHERE created_at >= ? ORDER BY expected_value DESC",
         (latest_created - 1.0,),
     ).fetchall()
     conn.close()
     moves = [dict(r) for r in rows]
-    return {"moves": moves, "window_start": moves[0]["window_start"] if moves else None}
+    return {"moves": moves, "window_start": moves[0]["window_start"] if moves else None, "predictions_ready": predictions_ready}
 
 
 @app.get("/api/evaluation")
@@ -256,6 +257,7 @@ def get_evaluation(min_probability: float = MIN_CANDIDATE_PROBABILITY, threshold
 
     cluster = ShardCluster()
     hot_records = ever_hot_records(str(DEFAULT_DB_PATH))
+    first_hot = first_hot_window_start(str(DEFAULT_DB_PATH))
     heatshard_result = compute_plan(str(DEFAULT_DB_PATH), min_probability=min_probability, cluster=cluster)
     if heatshard_result is None:
         return {"available": False, "reason": "no predictions found -- run the prediction pipeline first"}
@@ -290,6 +292,8 @@ def get_evaluation(min_probability: float = MIN_CANDIDATE_PROBABILITY, threshold
         "heatshard_window": heatshard_window,
         "reactive_window": reactive_window,
         "lead_time_seconds": (reactive_window - heatshard_window) if reactive_window is not None else None,
+        # positive = HeatShard decided BEFORE the first hot window actually appeared
+        "lead_vs_first_hot_seconds": (first_hot - heatshard_window) if first_hot is not None else None,
         "results": results,
     }
 
@@ -346,6 +350,11 @@ def run_scenario(payload: dict = Body(default={})):
         "--spike-num-records", str(payload.get("spike_num_records", 3)),
         "--spike-magnitude", str(payload.get("spike_magnitude", 8.0)),
         "--spike-bias", str(payload.get("spike_bias", 0.85)),
+        # optional realism knobs (0 = the original, easy scenario): unannounced
+        # surprise spikes, decoy events that never surge, and a ramped spike
+        "--surprise-num-records", str(payload.get("surprise_num_records", 0)),
+        "--decoy-num-records", str(payload.get("decoy_num_records", 0)),
+        "--ramp-seconds", str(payload.get("ramp_seconds", 0)),
     ]
     try:
         _scenario.start(args)

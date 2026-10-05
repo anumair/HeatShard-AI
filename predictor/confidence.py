@@ -42,10 +42,12 @@ class AdaptiveThreshold:
         self.target_precision = target_precision
         self.lower_margin = lower_margin
         self._outcomes = deque(maxlen=outcome_window)  # 1 = flagged prediction was later validated, 0 = wasn't
+        self._seen = 0
         self.history = []  # (n_outcomes_seen, threshold) logged every time the threshold moves
 
     def record_outcome(self, was_correct: bool):
         self._outcomes.append(1 if was_correct else 0)
+        self._seen += 1
         if len(self._outcomes) < self._outcomes.maxlen:
             return  # not enough recent flags yet to judge precision
 
@@ -61,4 +63,8 @@ class AdaptiveThreshold:
             self.threshold = new_threshold
 
         if moved:
-            self.history.append((len(self.history) + len(self._outcomes), self.threshold))
+            # Judge the new threshold on fresh outcomes only. Without this the
+            # rolling window slides one outcome at a time and the bar can move
+            # on every single new outcome (0.38 -> 0.33 -> 0.28 -> 0.33 ...).
+            self._outcomes.clear()
+            self.history.append((self._seen, self.threshold))

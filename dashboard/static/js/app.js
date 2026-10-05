@@ -172,6 +172,20 @@ async function pollScenarioLog() {
   }
 }
 
+// On a fresh page load after a scenario has already finished, show its last
+// log instead of the "Launch a flash sale" placeholder.
+async function showLastScenarioLog() {
+  try {
+    const status = await api("/api/scenario/status");
+    if (!status.running && status.lines.length) {
+      $("logBox").textContent = status.lines.join("\n");
+      $("logSub").textContent = `last run (code ${status.returncode})`;
+    }
+  } catch (e) {
+    /* leave the placeholder */
+  }
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -284,12 +298,16 @@ async function refreshPlan() {
     return;
   }
   const moves = data.moves || [];
-  $("planSub").textContent = moves.length ? `${moves.length} move(s)` : "no plan yet";
+  const ranWithoutMoves = !moves.length && data.predictions_ready;
+  $("planSub").textContent = moves.length ? `${moves.length} move(s)` : ranWithoutMoves ? "no move recommended" : "no plan yet";
 
   const tbody = document.querySelector("#tablePlan tbody");
   tbody.innerHTML = "";
   if (!moves.length) {
-    tbody.innerHTML = `<tr><td colspan="7" class="empty-msg">Run the pipeline to compute a relocation plan.</td></tr>`;
+    const msg = ranWithoutMoves
+      ? "The pipeline ran, but no flagged record had a positive expected value (for example its shard is already lightly loaded), so no relocation is recommended."
+      : "Run the pipeline to compute a relocation plan.";
+    tbody.innerHTML = `<tr><td colspan="7" class="empty-msg">${msg}</td></tr>`;
     return;
   }
   moves.forEach((m) => {
@@ -411,10 +429,16 @@ async function refreshEvaluation() {
 
   const results = data.results;
   const byName = Object.fromEntries(results.map((r) => [r.name, r]));
-  const leadTime = data.lead_time_seconds;
+  const leadVsHot = data.lead_vs_first_hot_seconds;
+  const timing =
+    leadVsHot === null || leadVsHot === undefined
+      ? { value: "–", label: "HeatShard timing vs first hotspot" }
+      : leadVsHot > 0
+        ? { value: fmt(leadVsHot, 0) + "s", label: "HeatShard acted BEFORE the first hotspot" }
+        : { value: fmt(-leadVsHot, 0) + "s", label: "HeatShard acted AFTER the first hotspot appeared" };
 
   $("evalHeadline").innerHTML = `
-    <div class="eval-stat accent"><div class="v">${leadTime !== null ? fmt(leadTime, 0) + "s" : "–"}</div><div class="l">HeatShard lead time</div></div>
+    <div class="eval-stat accent"><div class="v">${timing.value}</div><div class="l">${timing.label}</div></div>
     <div class="eval-stat"><div class="v">${data.ground_truth_hot_count}</div><div class="l">records actually hot</div></div>
     <div class="eval-stat good"><div class="v">${fmt(byName.heatshard.precision * 100, 0)}%</div><div class="l">HeatShard precision</div></div>
     <div class="eval-stat bad"><div class="v">${fmt(byName.reactive.data_movement, 0)}×</div><div class="l">reactive data movement</div></div>
@@ -580,6 +604,7 @@ $("btnPipeline").addEventListener("click", async () => {
 });
 
 refreshAll();
+showLastScenarioLog();
 setInterval(refreshStatus, 4000);
 setInterval(() => {
   if (!scenarioPolling) refreshAll();

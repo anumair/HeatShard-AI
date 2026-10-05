@@ -26,8 +26,9 @@ snapshot as its unmoved reference point, so its "before" state is a
 fair apples-to-apples baseline for what doing nothing would have looked
 like at that same moment.
 
-Ground truth ("did a record actually become hot") reuses HeatIndex's
-own is_spike rule, scanned across the whole recorded scenario.
+Ground truth ("did a record actually become hot") reuses the shared
+predictor/labels.py is_hot rule (a sustained surge against the record's
+own lagged baseline), scanned across the whole recorded scenario.
 """
 
 import argparse
@@ -47,36 +48,41 @@ from collector.storage import DEFAULT_DB_PATH  # noqa: E402
 from common.shard_client import ShardCluster  # noqa: E402
 from planner.reactive_baseline import DEFAULT_THRESHOLD_MULTIPLIER, reactive_plan  # noqa: E402
 from planner.run_relocation import MIN_CANDIDATE_PROBABILITY, compute_plan  # noqa: E402
-from predictor.heat_index import SPIKE_HISTORY_WINDOWS, SPIKE_MULTIPLIER  # noqa: E402
+from predictor.labels import hot_windows  # noqa: E402
 
 DEFAULT_OUT_PATH = Path(__file__).resolve().parent.parent / "data" / "evaluation.png"
 
 
-def ever_hot_records(db_path) -> set:
-    """Every record that actually spiked (is_spike ground-truth rule) at
-    any point in the recorded scenario."""
+def _hot_window_starts(db_path) -> dict:
+    """{record_id: [window_start of every hot window]} under the shared
+    predictor/labels.py rule, over the whole recorded scenario."""
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        "SELECT record_id, window_start, access_count FROM metric_windows ORDER BY record_id, window_start"
-    ).fetchall()
+    rows = conn.execute("SELECT record_id, window_start, window_end, access_count FROM metric_windows").fetchall()
     conn.close()
 
-    by_record = {}
-    for r in rows:
-        by_record.setdefault(r["record_id"], []).append(r["access_count"])
+    starts = sorted({r["window_start"] for r in rows})
+    index = {ws: i for i, ws in enumerate(starts)}
+    window_seconds = float(np.median([r["window_end"] - r["window_start"] for r in rows])) if rows else 0.0
 
-    hot = set()
-    for record_id, series in by_record.items():
-        for i in range(1, len(series)):
-            history = series[max(0, i - SPIKE_HISTORY_WINDOWS): i]
-            if len(history) < 2:
-                continue
-            baseline = sum(history) / len(history)
-            if series[i] > SPIKE_MULTIPLIER * max(baseline, 1.0):
-                hot.add(record_id)
-                break
-    return hot
+    series = {}
+    for r in rows:
+        series.setdefault(r["record_id"], [0] * len(starts))[index[r["window_start"]]] = r["access_count"]
+    hot = {record_id: [starts[i] for i in hot_windows(counts, window_seconds)] for record_id, counts in series.items()}
+    return {record_id: windows for record_id, windows in hot.items() if windows}
+
+
+def ever_hot_records(db_path) -> set:
+    """Every record that actually got hot (predictor/labels.py rule) in
+    any window of the recorded scenario."""
+    return set(_hot_window_starts(db_path))
+
+
+def first_hot_window_start(db_path):
+    """Start time of the earliest hot window of any record (the moment
+    the first hotspot actually materialised), or None if nothing got hot."""
+    windows = [w for ws in _hot_window_starts(db_path).values() for w in ws]
+    return min(windows) if windows else None
 
 
 def load_at_window(db_path, up_to_window_start, cluster, window_lookback=5):
@@ -109,15 +115,19 @@ def load_at_window(db_path, up_to_window_start, cluster, window_lookback=5):
 
 
 def find_reactive_trigger(db_path, cluster, threshold_multiplier, window_lookback=5):
-    """Scans the scenario chronologically for the first window where a
-    shard's rolling load crosses the threshold. Returns
+    """Scans the scenario chronologically (once a full `window_lookback`
+    of history exists) for the first window where a shard's rolling load
+    crosses the threshold. Returns
     (window_start, shard_load, record_load), or (None, {}, {}) if it
     never triggers in this scenario."""
     conn = sqlite3.connect(db_path)
     windows = [r[0] for r in conn.execute("SELECT DISTINCT window_start FROM metric_windows ORDER BY window_start ASC").fetchall()]
     conn.close()
 
-    for window_start in windows:
+    # A reactive monitor needs a full lookback of observed history before it
+    # can judge load; without this it fires on single-window Zipf noise in
+    # the very first window, which is a strawman, not a baseline.
+    for window_start in windows[window_lookback - 1:]:
         shard_load, record_load = load_at_window(db_path, window_start, cluster, window_lookback)
         if not shard_load:
             continue
@@ -125,6 +135,25 @@ def find_reactive_trigger(db_path, cluster, threshold_multiplier, window_lookbac
         if any(load > avg_load * threshold_multiplier for load in shard_load.values()):
             return window_start, shard_load, record_load
     return None, {}, {}
+
+
+def peak_reference(db_path, cluster, window_lookback=5):
+    """(shard_load, record_load) at the window where the cluster is most
+    imbalanced (highest rolling shard-load variance) -- the moment a
+    relocation plan actually needs to have helped. Every system's plan is
+    scored against this same future moment, so a system that acts early
+    (before the load has built up) is not penalised for that, and one that
+    acts late is not credited for it."""
+    conn = sqlite3.connect(db_path)
+    windows = [r[0] for r in conn.execute("SELECT DISTINCT window_start FROM metric_windows ORDER BY window_start ASC").fetchall()]
+    conn.close()
+    best = (-1.0, {}, {})
+    for window_start in windows[window_lookback - 1:]:
+        shard_load, record_load = load_at_window(db_path, window_start, cluster, window_lookback)
+        v = variance(shard_load)
+        if v > best[0]:
+            best = (v, shard_load, record_load)
+    return best[1], best[2]
 
 
 def variance(loads: dict) -> float:

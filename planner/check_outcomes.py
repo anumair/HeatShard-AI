@@ -16,32 +16,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from collector.storage import DEFAULT_DB_PATH  # noqa: E402
 from planner import storage as planner_storage  # noqa: E402
 from predictor.confidence import AdaptiveThreshold  # noqa: E402
-from predictor.heat_index import SPIKE_HISTORY_WINDOWS, SPIKE_MULTIPLIER  # noqa: E402
+from predictor.labels import HISTORY_LEN, is_hot  # noqa: E402
 
 
 def was_actually_hot(db_path, record_id: str, window_start: float) -> bool:
-    """Same rule as HeatIndex.is_spike, applied directly to recorded
-    history: did access_count exceed SPIKE_MULTIPLIER times the rolling
-    baseline in the window right after `window_start`?"""
+    """Same shared rule as the training labels (predictor/labels.py), applied
+    directly to recorded history: was the record hot in the window right
+    after `window_start`?"""
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    starts = [r[0] for r in conn.execute("SELECT DISTINCT window_start FROM metric_windows ORDER BY window_start ASC").fetchall()]
     rows = conn.execute(
-        "SELECT window_start, access_count FROM metric_windows WHERE record_id = ? ORDER BY window_start ASC",
-        (record_id,),
+        "SELECT window_start, window_end, access_count FROM metric_windows WHERE record_id = ?", (record_id,)
     ).fetchall()
+    window_seconds = conn.execute("SELECT MAX(window_end - window_start) FROM metric_windows").fetchone()[0] or 0.0
     conn.close()
 
-    series = [(r["window_start"], r["access_count"]) for r in rows]
-    idx = next((i for i, (ws, _) in enumerate(series) if ws == window_start), None)
-    if idx is None or idx + 1 >= len(series):
+    idx = next((i for i, ws in enumerate(starts) if ws == window_start), None)
+    if idx is None or idx + 1 >= len(starts):
         return False  # plan's window not found, or no later window recorded yet
 
-    history = [count for _, count in series[max(0, idx - SPIKE_HISTORY_WINDOWS + 1): idx + 1]]
-    if len(history) < 2:
-        return False
-    baseline = sum(history) / len(history)
-    next_access = series[idx + 1][1]
-    return next_access > SPIKE_MULTIPLIER * max(baseline, 1.0)
+    by_start = {r["window_start"]: r["access_count"] for r in rows}
+    counts = [by_start.get(ws, 0) for ws in starts]
+    return is_hot(counts[idx + 1], counts[max(0, idx + 1 - HISTORY_LEN): idx + 1], window_seconds)
 
 
 def main():

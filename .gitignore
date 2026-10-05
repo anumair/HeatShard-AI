@@ -13,4 +13,9 @@ data/*.png
 data/olist_records.json
 data/training_runs/
 data/xgb_model.json
+data/xgb_model.meta.json
+data/training_v2/
+data/test_v2/
+data/*.log
+data/prediction_eval.json
 data/eval_runs/

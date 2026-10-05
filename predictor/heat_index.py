@@ -19,12 +19,12 @@ import numpy as np
 
 from collector.events import EventStore
 from predictor.features import DEFAULT_WEIGHTS, FEATURE_NAMES
+from predictor.labels import HISTORY_LEN, is_hot
 from predictor.weight_fitter import WeightFitter
 
 DECAY_LAMBDA = 0.6  # metric(t) = lambda*raw(t) + (1-lambda)*metric(t-1)
 EVENT_HORIZON_SECONDS = 120.0  # how far ahead a scheduled event starts contributing signal
-SPIKE_HISTORY_WINDOWS = 5  # rolling baseline window count used to label "did it spike?"
-SPIKE_MULTIPLIER = 3.0  # next-window access_count > multiplier * rolling baseline => spike
+NO_EVENT_TTE = 150.0  # "seconds until event" sentinel when no announced event is near
 
 
 class RecordState:
@@ -32,7 +32,9 @@ class RecordState:
 
     def __init__(self):
         self.decayed = {name: 0.0 for name in FEATURE_NAMES}
-        self.access_history = deque(maxlen=SPIKE_HISTORY_WINDOWS)
+        # Window-aligned access counts (a 0 for every window the record was
+        # idle), newest last -- what predictor/labels.py judges "hot" against.
+        self.access_history = deque(maxlen=HISTORY_LEN)
 
 
 class HeatIndex:
@@ -61,14 +63,28 @@ class HeatIndex:
         # Stage 4's live PredictionEngine reads this right after process_window().
         self.last_normalized_features = {}
 
-    def _event_signal(self, record_id: str, now: float) -> float:
-        best = 0.0
-        for e in self.events.for_record(record_id):
+    def _nearest_event(self, record_id: str, now: float):
+        """(signal, seconds_until_start, magnitude) of the strongest
+        already-announced event near `now`; (0.0, NO_EVENT_TTE, 0.0) if none."""
+        best = (0.0, NO_EVENT_TTE, 0.0)
+        for e in self.events.visible_for_record(record_id, now):
             dt = e["scheduled_time"] - now
             if -30.0 <= dt <= EVENT_HORIZON_SECONDS:
-                proximity = 1.0 - max(dt, 0.0) / EVENT_HORIZON_SECONDS
-                best = max(best, proximity * e.get("expected_magnitude", 1.0))
+                magnitude = e.get("expected_magnitude", 1.0)
+                signal = (1.0 - max(dt, 0.0) / EVENT_HORIZON_SECONDS) * magnitude
+                if signal > best[0]:
+                    best = (signal, dt, magnitude)
         return best
+
+    def _event_signal(self, record_id: str, now: float) -> float:
+        return self._nearest_event(record_id, now)[0]
+
+    def event_features(self, record_id: str, now: float) -> dict:
+        """Raw (un-normalized) event context for the prediction models:
+        whether an announced event is near, how many seconds until it
+        starts (negative once started), and its announced magnitude."""
+        _, tte, magnitude = self._nearest_event(record_id, now)
+        return {"event_announced": 1.0 if magnitude > 0 else 0.0, "event_tte": tte, "event_magnitude": magnitude}
 
     def _raw_features(self, record_id: str, counters, window_seconds: float, window_end: float) -> dict:
         access = counters.access_count
@@ -95,12 +111,13 @@ class HeatIndex:
         z = (matrix - mean) / std
         return {rid: dict(zip(FEATURE_NAMES, z[i])) for i, rid in enumerate(record_ids)}
 
-    def is_spike(self, record_id: str, access_count: int) -> bool:
-        history = self._state[record_id].access_history
-        if len(history) < 2:
-            return False
-        baseline = sum(history) / len(history)
-        return access_count > SPIKE_MULTIPLIER * max(baseline, 1.0)
+    def is_hot(self, record_id: str, access_count: int, window_seconds: float) -> bool:
+        """Would `access_count` in the window being processed count as hot?
+        Judged against history up to (excluding) that window."""
+        return is_hot(access_count, self._state[record_id].access_history, window_seconds)
+
+    def count_history(self, record_id: str) -> list:
+        return list(self._state[record_id].access_history)
 
     def process_window(self, counters: dict, window_start: float, window_end: float) -> dict:
         """counters: {record_id: obj with .access_count/.write_count/.cache_miss_count/.avg_latency_ms}.
@@ -113,7 +130,7 @@ class HeatIndex:
         # now that we know what this record actually did this window.
         for record_id, features in self._pending_features.items():
             actual = counters[record_id].access_count if record_id in counters else 0
-            label = 1 if self.is_spike(record_id, actual) else 0
+            label = 1 if self.is_hot(record_id, actual, window_seconds) else 0
             self._fitter.add_sample(features, label)
             if self._sample_callback:
                 self._sample_callback(record_id, features, label)
@@ -139,8 +156,12 @@ class HeatIndex:
             for record_id, feats in normalized.items()
         }
 
-        for record_id, c in counters.items():
-            self._state[record_id].access_history.append(c.access_count)
+        for record_id, state in self._state.items():
+            if record_id in counters:
+                state.access_history.append(counters[record_id].access_count)
+            else:  # idle this window: cool its decayed metrics and log a zero
+                state.access_history.append(0)
+                state.decayed = {name: (1 - self.decay_lambda) * v for name, v in state.decayed.items()}
 
         self._pending_features = normalized
         self.last_normalized_features = normalized

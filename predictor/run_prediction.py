@@ -1,7 +1,7 @@
 """Stage 4 CLI: run the Hybrid Prediction Engine over a recorded scenario.
 
-Replays the scenario's windows chronologically through HeatIndex (for
-heat scores + normalized features) and PredictionEngine (trend + XGBoost
+Replays the scenario's windows chronologically through FeaturePipeline
+(heat index + engineered features) and PredictionEngine (trend + XGBoost
 ensemble), persists per-window predictions, feeds the adaptive
 confidence threshold real outcomes as they resolve one window later, and
 -- if a scenario manifest is available -- prints each spike record's
@@ -23,7 +23,7 @@ from collector.events import EventStore  # noqa: E402
 from collector.storage import DEFAULT_DB_PATH  # noqa: E402
 from predictor import storage as heat_storage  # noqa: E402
 from predictor.confidence import AdaptiveThreshold  # noqa: E402
-from predictor.heat_index import HeatIndex  # noqa: E402
+from predictor.pipeline import FeaturePipeline  # noqa: E402
 from predictor.prediction_engine import PredictionEngine  # noqa: E402
 from predictor.window_reader import read_windows  # noqa: E402
 from predictor.xgb_model import XGBHotspotModel  # noqa: E402
@@ -53,7 +53,7 @@ def main():
     heat_storage.clear_prediction_tables(args.db)
 
     events = EventStore(path=args.events)
-    heat_index = HeatIndex(events=events)
+    pipeline = FeaturePipeline(events=events)
 
     xgb_model = None
     model_path = Path(args.model)
@@ -63,7 +63,17 @@ def main():
     else:
         print(f"no XGBoost model at {model_path} -- running trend-only (train one with predictor/train_xgboost.py)")
 
-    threshold = AdaptiveThreshold(initial=args.initial_threshold) if args.initial_threshold is not None else AdaptiveThreshold()
+    if args.initial_threshold is not None:
+        threshold = AdaptiveThreshold(initial=args.initial_threshold)
+    elif xgb_model is not None and "threshold" in xgb_model.meta:
+        # start from the operating point validated at training time and only
+        # correct drift away from the precision that point achieved
+        validated_precision = xgb_model.meta.get("precision_at_threshold", 0.6)
+        threshold = AdaptiveThreshold(
+            initial=xgb_model.meta["threshold"], target_precision=max(0.3, validated_precision - 0.1)
+        )
+    else:
+        threshold = AdaptiveThreshold()
     engine = PredictionEngine(xgb_model=xgb_model, threshold=threshold)
 
     pending_flags = {}  # record_id -> True, carried one window to check against the actual outcome
@@ -72,13 +82,13 @@ def main():
     for window_start, window_end, counters in read_windows(args.db):
         window_index += 1
 
+        step = pipeline.step(counters, window_start, window_end)
+        outcomes = {record_id: label for record_id, _, label in step.resolved}
         for record_id in pending_flags:
-            actual = counters[record_id].access_count if record_id in counters else 0
-            threshold.record_outcome(heat_index.is_spike(record_id, actual))
+            threshold.record_outcome(bool(outcomes.get(record_id, 0)))
         pending_flags = {}
 
-        heat_scores = heat_index.process_window(counters, window_start, window_end)
-        predictions = engine.predict_window(heat_scores, heat_index.last_normalized_features)
+        predictions = engine.predict_window(step.features)
         heat_storage.write_predictions(args.db, window_start, window_end, predictions)
         heat_storage.write_threshold_history(args.db, window_index, threshold.threshold)
 

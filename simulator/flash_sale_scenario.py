@@ -13,6 +13,16 @@ collector:
                sale" records, at the same overall rate as baseline
   cooldown   - back to normal Zipfian traffic
 
+Three optional realism knobs keep the event channel from being a perfect
+oracle (default 0 = the original, easy scenario):
+
+  surprise_num_records - records that surge mid-spike with NO event
+                         metadata (an organic / viral spike nobody scheduled)
+  decoy_num_records    - records that ARE announced as flash sales but never
+                         actually surge (cancelled / fizzled promotions)
+  ramp_seconds         - traffic bias ramps up linearly instead of jumping
+                         to full strength at the start of the spike
+
 A manifest recording exactly which records spiked and the wall-clock
 boundaries of each phase is written to data/scenarios/ (ground-truth
 labels for Stage 4's predictor training) and mirrored to
@@ -57,6 +67,10 @@ class ScenarioConfig:
     spike_num_records: int = 4
     spike_magnitude: float = 8.0
     spike_bias: float = 0.85  # P(traffic goes to a spike record) during the spike phase
+    surprise_num_records: int = 0
+    decoy_num_records: int = 0
+    ramp_seconds: float = 0.0
+    surprise_delay_fraction: float = 0.3  # surprise records start surging this far into the spike phase
     key_source: str = "olist"  # or "synthetic" for the original product:i / reviews:i / inventory:i scheme
 
 
@@ -108,15 +122,29 @@ def run(cfg: ScenarioConfig, db_path=None, events_path=None):
     worker.start()
 
     baseline_sampler = ZipfSampler(num_keys, skew=cfg.skew, seed=cfg.seed)
-    spike_ranks = rng.sample(range(num_keys), cfg.spike_num_records)
-    spike_records = [key_space.record_id(i) for i in spike_ranks]
+    n_event, n_surprise, n_decoy = cfg.spike_num_records, cfg.surprise_num_records, cfg.decoy_num_records
+    all_ranks = rng.sample(range(num_keys), n_event + n_surprise + n_decoy)
+    spike_ranks = all_ranks[:n_event]  # announced AND surge
+    surprise_ranks = all_ranks[n_event:n_event + n_surprise]  # surge, never announced
+    decoy_ranks = all_ranks[n_event + n_surprise:]  # announced, never surge
+    event_spike_records = [key_space.record_id(i) for i in spike_ranks]
+    surprise_records = [key_space.record_id(i) for i in surprise_ranks]
+    decoy_records = [key_space.record_id(i) for i in decoy_ranks]
+    spike_records = event_spike_records + surprise_records  # every record that genuinely gets hot
 
     def normal_pick():
         return baseline_sampler.sample()
 
+    spike_started_at = [None]
+
     def spike_pick():
-        if rng.random() < cfg.spike_bias:
-            return rng.choice(spike_ranks)
+        elapsed = time.monotonic() - spike_started_at[0]
+        ramp = min(1.0, elapsed / cfg.ramp_seconds) if cfg.ramp_seconds > 0 else 1.0
+        active = spike_ranks
+        if surprise_ranks and elapsed >= cfg.surprise_delay_fraction * cfg.spike_seconds:
+            active = spike_ranks + surprise_ranks
+        if rng.random() < cfg.spike_bias * ramp:
+            return rng.choice(active)
         return baseline_sampler.sample()
 
     phases = []
@@ -151,14 +179,20 @@ def run(cfg: ScenarioConfig, db_path=None, events_path=None):
         {
             "record_id": rid,
             "event_type": "flash_sale",
+            "announced_at": now,  # replay must not "know" about the event before this instant
             "scheduled_time": now + cfg.lead_seconds,
-            "expected_magnitude": cfg.spike_magnitude,
+            "expected_magnitude": cfg.spike_magnitude * (rng.uniform(0.7, 1.3) if rid in decoy_records else 1.0),
         }
-        for rid in spike_records
+        for rid in event_spike_records + decoy_records
     ]
     write_events(events, path=events_path)
     event_registered_at = now
-    print(f"\nregistered event metadata for {spike_records} -> spike scheduled at +{cfg.lead_seconds:.0f}s\n")
+    print(f"\nregistered event metadata for {event_spike_records + decoy_records} -> spike scheduled at +{cfg.lead_seconds:.0f}s")
+    if surprise_records:
+        print(f"(unannounced surprise spikes: {surprise_records})")
+    if decoy_records:
+        print(f"(decoy events that will fizzle: {decoy_records})")
+    print()
 
     ops_pre = run_phase(
         collector, key_space, normal_pick, "pre_spike (event known, traffic still normal)",
@@ -167,6 +201,7 @@ def run(cfg: ScenarioConfig, db_path=None, events_path=None):
     t2 = time.time()
     phases.append({"name": "pre_spike", "start": t1, "end": t2, "ops": ops_pre})
 
+    spike_started_at[0] = time.monotonic()
     ops_spike = run_phase(
         collector, key_space, spike_pick, f"SPIKE on {spike_records}",
         cfg.spike_seconds, cfg.rate, cfg.write_ratio, cfg.group_ratio, rng,
@@ -188,6 +223,9 @@ def run(cfg: ScenarioConfig, db_path=None, events_path=None):
     manifest = {
         "config": asdict(cfg),
         "spike_records": spike_records,
+        "event_spike_records": event_spike_records,
+        "surprise_records": surprise_records,
+        "decoy_records": decoy_records,
         "event_registered_at": event_registered_at,
         "phases": phases,
         "db_path": str(collector.db_path),
@@ -228,6 +266,9 @@ if __name__ == "__main__":
     parser.add_argument("--spike-num-records", type=int, default=ScenarioConfig.spike_num_records)
     parser.add_argument("--spike-magnitude", type=float, default=ScenarioConfig.spike_magnitude)
     parser.add_argument("--spike-bias", type=float, default=ScenarioConfig.spike_bias)
+    parser.add_argument("--surprise-num-records", type=int, default=ScenarioConfig.surprise_num_records)
+    parser.add_argument("--decoy-num-records", type=int, default=ScenarioConfig.decoy_num_records)
+    parser.add_argument("--ramp-seconds", type=float, default=ScenarioConfig.ramp_seconds)
     parser.add_argument("--db", default=None, help="metrics db path (default: data/metrics.db)")
     parser.add_argument("--events-out", default=None, help="event feed path (default: data/events.json)")
     parser.add_argument("--key-source", choices=["synthetic", "olist"], default=ScenarioConfig.key_source)
@@ -249,5 +290,8 @@ if __name__ == "__main__":
         spike_num_records=args.spike_num_records,
         spike_magnitude=args.spike_magnitude,
         spike_bias=args.spike_bias,
+        surprise_num_records=args.surprise_num_records,
+        decoy_num_records=args.decoy_num_records,
+        ramp_seconds=args.ramp_seconds,
     )
     run(cfg, db_path=args.db, events_path=args.events_out)

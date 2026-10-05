@@ -27,25 +27,33 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
 from common.shard_client import ShardCluster  # noqa: E402
-from planner.evaluate import evaluate_system, ever_hot_records, find_reactive_trigger  # noqa: E402
+from planner.evaluate import (  # noqa: E402
+    evaluate_system, ever_hot_records, find_reactive_trigger, first_hot_window_start, hypothetical_loads, peak_reference, variance,
+)
 from planner.reactive_baseline import DEFAULT_THRESHOLD_MULTIPLIER, reactive_plan  # noqa: E402
 from planner.run_relocation import MIN_CANDIDATE_PROBABILITY, compute_plan  # noqa: E402
 from simulator.flash_sale_scenario import ScenarioConfig  # noqa: E402
+from simulator.generate_training_runs import varied_config  # noqa: E402
 from simulator.flash_sale_scenario import run as run_scenario  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 EVAL_DIR = PROJECT_ROOT / "data" / "eval_runs"
 DEFAULT_OUT_PATH = PROJECT_ROOT / "data" / "evaluation_aggregate.png"
 
-METRICS = ["data_movement", "precision", "recall", "false_positive_rate", "variance_before", "variance_after"]
+METRICS = [
+    "data_movement", "precision", "recall", "false_positive_rate",
+    "variance_before", "variance_after", "peak_variance_before", "peak_variance_after",
+]
 SYSTEMS = ["static", "reactive", "heatshard"]
 METRIC_TITLES = {
     "data_movement": "Data movement (records)",
     "precision": "Relocation precision",
     "recall": "Relocation recall",
     "false_positive_rate": "False-positive rate",
-    "variance_before": "Variance before",
-    "variance_after": "Variance after",
+    "variance_before": "Variance at decision time: before",
+    "variance_after": "Variance at decision time: after",
+    "peak_variance_before": "Variance at the load peak: before",
+    "peak_variance_after": "Variance at the load peak: after",
 }
 
 
@@ -89,12 +97,27 @@ def evaluate_one(db_path, cluster, min_probability, threshold_multiplier, window
     }
 
     results = {name: evaluate_system(name, moves, sl, rl, hot_records) for name, (moves, sl, rl) in systems.items()}
+
+    # Also score every plan against the SAME future moment: when the cluster
+    # is most imbalanced. Decision-time variance alone flatters late actors
+    # (the load has already built up) and penalises early ones.
+    peak_shard_load, peak_record_load = peak_reference(str(db_path), cluster, window_lookback)
+    for name, (moves, _, _) in systems.items():
+        results[name]["peak_variance_before"] = variance(peak_shard_load)
+        results[name]["peak_variance_after"] = variance(hypothetical_loads(peak_shard_load, [m for m in moves], peak_record_load))
     lead_time = (reactive_window - heatshard_window) if reactive_window is not None else None
-    return results, lead_time
+    # Timing relative to when the first hotspot actually materialised
+    # (positive = acted BEFORE it): the fair way to compare "predict" vs "react".
+    first_hot = first_hot_window_start(str(db_path))
+    lead_vs_hot = {
+        "heatshard": (first_hot - heatshard_window) if first_hot is not None else None,
+        "reactive": (first_hot - reactive_window) if (first_hot is not None and reactive_window is not None) else None,
+    }
+    return results, lead_time, lead_vs_hot
 
 
 def plot_summary(summary, out_path, n):
-    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+    fig, axes = plt.subplots(2, 4, figsize=(19, 8))
     colors = {"static": "#888888", "reactive": "#f87171", "heatshard": "#22d3ee"}
 
     for ax, metric in zip(axes.flat, METRICS):
@@ -120,6 +143,8 @@ def main():
     parser.add_argument("--window-seconds", type=float, default=3.0)
     parser.add_argument("--rate", type=float, default=30.0)
     parser.add_argument("--spike-num-records", type=int, default=3)
+    parser.add_argument("--fixed-shape", action="store_true", help="use the manual shape flags above instead of the varied, harder scenario distribution (surprise spikes, decoy events, ramps) the model is trained on")
+    parser.add_argument("--reuse-existing", action="store_true", help="re-score scenario dbs already in data/eval_runs (with predictions) instead of regenerating them")
     parser.add_argument("--min-probability", type=float, default=MIN_CANDIDATE_PROBABILITY)
     parser.add_argument("--threshold-multiplier", type=float, default=DEFAULT_THRESHOLD_MULTIPLIER)
     parser.add_argument("--out", default=str(DEFAULT_OUT_PATH))
@@ -140,6 +165,7 @@ def main():
 
     per_system_metrics = {name: {m: [] for m in METRICS} for name in SYSTEMS}
     lead_times = []
+    lead_vs_first_hot = {"heatshard": [], "reactive": []}
     completed = 0
 
     for i in range(args.num_runs):
@@ -148,10 +174,14 @@ def main():
         events_path = EVAL_DIR / f"eval_{seed}_events.json"
 
         print(f"\n=== eval run {i + 1}/{args.num_runs} (seed={seed}) ===", flush=True)
+        if not args.reuse_existing:
+            for stale in (db_path, events_path):
+                stale.unlink(missing_ok=True)  # the collector APPENDS to an existing db -- never reuse one
         try:
-            cfg = ScenarioConfig(seed=seed, **cfg_kwargs)
-            run_scenario(cfg, db_path=str(db_path), events_path=str(events_path))
-            compute_pipeline(db_path, events_path)
+            if not args.reuse_existing:
+                cfg = ScenarioConfig(seed=seed, **cfg_kwargs) if args.fixed_shape else varied_config(seed)
+                run_scenario(cfg, db_path=str(db_path), events_path=str(events_path))
+                compute_pipeline(db_path, events_path)
             outcome = evaluate_one(db_path, cluster, args.min_probability, args.threshold_multiplier)
         except Exception as exc:
             print(f"  run failed, skipping: {exc}")
@@ -161,8 +191,11 @@ def main():
             print("  no actionable predictions this run -- skipped")
             continue
 
-        results, lead_time = outcome
+        results, lead_time, lead_vs_hot = outcome
         completed += 1
+        for name, value in lead_vs_hot.items():
+            if value is not None:
+                lead_vs_first_hot[name].append(value)
         for name in SYSTEMS:
             for metric in METRICS:
                 per_system_metrics[name][metric].append(results[name][metric])
@@ -203,6 +236,12 @@ def main():
         )
     else:
         print("\nreactive never triggered in any completed run -- no lead-time distribution to report")
+
+    print("\nDecision time relative to when the first hotspot actually materialised (positive = acted BEFORE it):")
+    for name, values in lead_vs_first_hot.items():
+        if values:
+            v = np.array(values)
+            print(f"  {name:<10} mean={v.mean():+.1f}s std={v.std():.1f}s  acted before the first hot window in {int((v > 0).sum())}/{len(v)} runs")
 
     plot_summary(summary, args.out, completed)
     print(f"\nwrote {args.out}")

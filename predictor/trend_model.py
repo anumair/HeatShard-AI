@@ -1,47 +1,58 @@
-"""Statistical trend analysis: the cheap, always-on sub-model of the
-Hybrid Prediction Engine. Fits a linear slope over each record's last K
-heat scores, z-scores that slope across the window's active population
-(same normalization pattern as the heat index itself), and squashes it
-through a sigmoid so it lands on the same [0, 1] "P(hotspot)" scale as
-the XGBoost sub-model.
+"""Statistical trend sub-model: the cheap, always-on half of the Hybrid
+Prediction Engine.
+
+Forecasts a record's next-window access count with Holt's damped linear
+exponential smoothing over its recent per-window counts, then asks the
+same question the label asks: will that forecast clear the "hot" bar
+(predictor/labels.py -- HOT_MULTIPLIER x the record's lagged baseline, and
+above the absolute noise floor)? The log-ratio of forecast to that bar is
+squashed through a sigmoid onto a [0, 1] P(hotspot) scale.
+
+It is stateless -- everything it needs is the record's window-aligned
+count history -- so it can be applied to any record at any window, and its
+raw forecast is also handed to the XGBoost sub-model as an input feature.
 """
 
 import math
-from collections import defaultdict, deque
 
-import numpy as np
+from predictor.labels import HOT_BASELINE_FLOOR, HOT_MIN_QPS, HOT_MULTIPLIER, lagged_baseline
 
-TREND_WINDOW = 5  # how many past heat scores to fit the slope over
+ALPHA = 0.6  # level smoothing
+BETA = 0.4  # trend smoothing
+PHI = 0.8  # trend damping: surges are short, don't extrapolate them forever
+SHARPNESS = 3.0  # sigmoid steepness on the log(forecast / hot bar) scale
 
 
 def _sigmoid(x: float) -> float:
     return 1.0 / (1.0 + math.exp(-x))
 
 
+def forecast_next(counts) -> float:
+    """Damped-trend Holt forecast of the next window's count."""
+    counts = list(counts)
+    if not counts:
+        return 0.0
+    level = float(counts[0])
+    trend = float(counts[1] - counts[0]) if len(counts) > 1 else 0.0
+    for c in counts[1:]:
+        previous_level = level
+        level = ALPHA * c + (1 - ALPHA) * (previous_level + PHI * trend)
+        trend = BETA * (level - previous_level) + (1 - BETA) * PHI * trend
+    return max(level + PHI * trend, 0.0)
+
+
+def hot_bar(counts, window_seconds: float) -> float:
+    """Access count the *next* window must reach to be labelled hot."""
+    return max(HOT_MULTIPLIER * max(lagged_baseline(counts), HOT_BASELINE_FLOOR), HOT_MIN_QPS * window_seconds)
+
+
 class TrendModel:
-    def __init__(self, window: int = TREND_WINDOW):
-        self.window = window
-        self._history = defaultdict(lambda: deque(maxlen=window))
-
-    def update_and_score(self, heat_scores: dict) -> dict:
-        """heat_scores: {record_id: heat score this window}. Returns {record_id: p_trend}."""
-        for record_id, score in heat_scores.items():
-            self._history[record_id].append(score)
-
-        slopes = {}
-        for record_id in heat_scores:
-            hist = self._history[record_id]
-            if len(hist) < 2:
-                slopes[record_id] = 0.0
-                continue
-            xs = np.arange(len(hist))
-            ys = np.array(hist)
-            slopes[record_id] = float(np.polyfit(xs, ys, 1)[0])
-
-        if not slopes:
-            return {}
-
-        values = np.array(list(slopes.values()))
-        mean, std = values.mean(), values.std()
-        std = std if std > 1e-9 else 1.0
-        return {rid: _sigmoid((s - mean) / std) for rid, s in slopes.items()}
+    def score(self, counts, window_seconds: float) -> dict:
+        """counts: the record's window-aligned history, newest last (current window included)."""
+        forecast = forecast_next(counts)
+        bar = hot_bar(counts, window_seconds)
+        return {
+            "trend_forecast": forecast,
+            "trend_ratio": forecast / bar,
+            "p_trend": _sigmoid(SHARPNESS * math.log((forecast + 1.0) / (bar + 1.0))),
+        }

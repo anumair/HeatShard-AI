@@ -55,6 +55,7 @@ or `flash_sale_scenario.py`.
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+brew install libomp           # macOS only: XGBoost needs the OpenMP runtime
 
 docker compose up -d          # start the 5 Redis shards
 python check_cluster.py       # confirm read/write + latency on every shard
@@ -130,8 +131,9 @@ recorded windows chronologically through `predictor/heat_index.py`:
 - z-score normalized across that window's active records, then combined
   via the weighted `Heat_i(t)` formula from the methodology
 - weights start fixed (`predictor/features.py`) and are periodically
-  refit via linear regression against observed outcomes -- did the
-  record actually spike in the window that followed? `--refit-every`
+  refit via ridge-regularised least squares (then smoothed and floored so
+  no signal collapses to zero) against observed outcomes -- was the record
+  hot in the window that followed (`predictor/labels.py`)? `--refit-every`
   defaults to 10 here for a fast demo; the methodology's target cadence
   for real use is 20-50 windows, with more history the refit is far less
   noisy than what you'll see in a 15-20 window demo run.
@@ -141,90 +143,124 @@ renders an actual PNG (`data/heat_plot.png`) -- the Stage 3 checkpoint
 test: heat should visibly rise leading into the flash sale and decay
 afterward for the spike records identified in the scenario's manifest.
 
-### Hybrid Prediction Engine (Stage 4)
+### Hybrid Prediction Engine (Stage 4) -- v2
 
 ```bash
-# 1. generate several scenarios as labeled training data (~1min each)
-python simulator/generate_training_runs.py --num-runs 16 --seed-start 200
+# 1. generate varied, deliberately imperfect training scenarios (~1 min each)
+python simulator/generate_training_runs.py --num-runs 60 --seed-start 300 --vary-params --out-dir data/training_v2
 
-# 2. train the XGBoost sub-model on all of them (repeat --db/--events per run)
-python predictor/train_xgboost.py \
-  --db data/training_runs/run_200.db --events data/training_runs/run_200_events.json \
-  --db data/training_runs/run_201.db --events data/training_runs/run_201_events.json \
-  ... # one pair per generated run
+# 2. a separate, never-trained-on set for held-out evaluation
+python simulator/generate_training_runs.py --num-runs 16 --seed-start 9000 --vary-params --out-dir data/test_v2
 
-# 3. run a fresh (held-out) scenario, then the prediction engine over it
-python simulator/flash_sale_scenario.py --seed 999
-python predictor/run_prediction.py --manifest data/scenarios/scenario_<ts from step 3>.json
+# 3. train (writes data/xgb_model.json + data/xgb_model.meta.json)
+python predictor/train_xgboost.py --db 'data/training_v2/run_*.db' --test-db 'data/test_v2/run_*.db'
+
+# 4. held-out evaluation: ablation, early warning, per-record-kind breakdown
+python predictor/evaluate_prediction.py --db 'data/test_v2/run_*.db'
+
+# 5. run the engine over any recorded scenario
+python predictor/run_prediction.py --manifest data/scenarios/scenario_<ts>.json
 ```
 
-`predictor/heat_index.py` (Stage 3) is reused as-is for feature
-extraction; Stage 4 adds:
+(Each run's event feed is expected next to its db as `run_<seed>_events.json`.)
 
-- `predictor/trend_model.py` -- fits a slope over each record's last 5
-  heat scores, z-scores it across the window's population, sigmoid ->
-  `p_trend`
-- `predictor/xgb_model.py` + `train_xgboost.py` -- an XGBoost classifier
-  trained on the heat index's own 7 normalized features, using the exact
-  same "did this record spike in the window that followed" labeling the
-  weight refitting already relies on (via `HeatIndex`'s `sample_callback`
-  hook), so training labels stay consistent with the rest of the system.
-  One scenario alone rarely has enough positive (spike) windows to train
-  on well -- `generate_training_runs.py` produces several independent
-  scenarios into separate db/events pairs for this.
-- `predictor/prediction_engine.py` -- averages `p_trend`/`p_xgb` into
-  `p_ensemble`, with confidence = model agreement (`1 - |p_trend - p_xgb|`);
-  degrades gracefully to trend-only if no XGBoost model is loaded yet
-- `predictor/confidence.py` -- `AdaptiveThreshold`: tracks the precision
-  of the last 10 flagged predictions and raises the acting threshold when
-  flags have been low-value, lowers it when they've been reliably correct
+**What it predicts.** `P(record is hot in the next window)`, where "hot" is
+defined once in `predictor/labels.py` and shared by training labels, the
+weight fitter, the adaptive threshold's feedback, relocation-outcome
+checking and the Stage 7 ground truth: the record's load is at least
+2.5 requests/s **and** at least 3x its own *lagged* baseline (the mean of
+the 6 windows that ended 3 windows ago, so a surge can't absorb itself
+into its own baseline). It is a *sustained-surge* label.
 
-`run_prediction.py` is the Stage 4 checkpoint test: it prints each spike
-record's `p_ensemble`/confidence trajectory against the scenario's phase
-boundaries. On a held-out scenario (seed unseen during training), spike
-records get flagged with high confidence right at the spike's first
-window -- computed from the *prior* (still-quiet) window's features, so
-it's a genuinely proactive flag, not a reactive one. With only a handful
-of pre-spike windows in a short demo scenario, don't expect a long,
-gradually-rising lead-up -- the real signal is the flag landing on the
-transition window itself rather than several windows into the spike.
+**Components**
 
-#### Honest accuracy numbers (scenario-level held-out evaluation)
+- `predictor/trend_model.py` -- statistical sub-model: a damped-trend
+  (Holt) forecast of the record's next-window count, compared against the
+  exact "hot bar" the label uses, squashed to `p_trend`. Stateless.
+- `predictor/xgb_model.py` + `train_xgboost.py` -- XGBoost on 21 features
+  (`predictor/features.py`): the heat index's 7 z-scored signals plus
+  per-second rate history (lags, ratio to the recent and lagged baselines,
+  share of traffic), the trend forecast, the heat score, and **raw event
+  timing** (announced flag, seconds-until-start, magnitude).
+- `predictor/calibration.py` -- isotonic calibration of both sub-models on
+  out-of-fold scores, so `p_ensemble` is a real probability for the
+  Relocation Planner's ExpectedValue arithmetic.
+- `predictor/prediction_engine.py` -- learned blend (weight chosen to
+  maximise out-of-fold average precision; stored in the model meta),
+  confidence = agreement of the two calibrated sub-models; degrades to
+  trend-only without a trained model.
+- `predictor/confidence.py` -- `AdaptiveThreshold`: starts at the
+  F1-optimal threshold found at training time and holds the validated
+  precision band (raises the bar when live precision drops below it,
+  lowers it when comfortably above), instead of searching blind.
+- `predictor/pipeline.py` -- one `FeaturePipeline` used identically by
+  training, replay and evaluation, so a feature or label can never be
+  computed two different ways.
 
-"Training accuracy" is a misleading metric here -- positive (spike)
-windows are only ~1% of samples, so a model that never predicts "hot"
-already scores ~99%. `train_xgboost.py --test-db/--test-events` (held
-out from training entirely, never seen) reports real precision/recall
-instead. It's a **scenario-level** split, not a random row split, since
-adjacent windows within one scenario are correlated (decayed features
-carry over) -- a random split would leak information between train and
-test.
+**Event channel, leak-free.** Events carry `announced_at`; replay keeps an
+event invisible until that instant (the earlier version loaded the final
+event file, so replay "knew" about flash sales ~20 s before they were
+announced). Records with an announced upcoming event are scored every
+window even with zero traffic, so a cold record can be flagged before its
+first request.
 
-`--test-db`/`--test-events` also exposed that plain accuracy AND the
-"textbook" `scale_pos_weight` (the full class-imbalance ratio, ~100x)
-were both misleading: at that weight, held-out precision collapsed to
-3.5% (858 false positives for 31 true positives). Sweeping the weight
-against held-out data found ~20 as the actual best precision/recall
-trade-off (`predictor/train_xgboost.py`'s `DEFAULT_MAX_SCALE_POS_WEIGHT`);
-override with `--scale-pos-weight` if you want a different point on that
-curve.
+**A harder simulator.** `flash_sale_scenario.py` can add (a) *surprise*
+spikes with no event metadata, (b) *decoy* events that are announced but
+never surge, and (c) ramped spikes. Without these every hot record was
+announced, so "announced => hot" looked like near-perfect prediction.
 
-We also tested whether *more* training data was the bottleneck:
-starting from 22 scenarios of one fixed shape (104 positive samples,
-best held-out F1 ~0.125), `simulator/generate_training_runs.py
---vary-params` generated 24 more scenarios with randomized spike
-magnitude/bias/num-records/skew (not just a new seed) for 46 total (275
-positive samples). Held-out F1 improved to ~0.147 -- a real but modest
-gain. Conclusion: more diverse data helps somewhat, but isn't the main
-lever left to pull; the harder constraints are the label design (only
-1-2 windows per scenario ever qualify as a "spike" under the
-transition-onset rule) and the small feature set. Worth knowing before
-sinking more time into generating additional scenarios expecting a
-large jump. In practice the deployed ensemble (trend + XGBoost +
-adaptive threshold, not the XGBoost classifier's raw 0.5-cutoff
-predictions) still flagged real spike records correctly in the Stage 4
-and Stage 6 checkpoint runs -- isolated classifier metrics understate
-how the full pipeline behaves.
+#### Held-out accuracy (16 scenarios never trained on; 12,502 record-windows, 169 hot)
+
+| variant | avg. precision | F1 @ validated threshold |
+|---|---|---|
+| heat score alone | 0.19 | -- |
+| current rate alone ("hot now => hot next") | 0.29 | -- |
+| trend sub-model alone | 0.41 | 0.54 |
+| XGBoost sub-model alone | 0.78 | 0.74 |
+| **blend (the engine)** | **0.79** | **0.735** (P 0.68, R 0.80) |
+
+Scenario-grouped 5-fold cross-validation on the 60 training scenarios
+gives F1 0.80 (P 0.78, R 0.83). The threshold (0.43) is fixed at training
+time and *not* tuned on the held-out set.
+
+By record kind (held-out):
+
+| record kind | hot rows | recall | note |
+|---|---|---|---|
+| announced flash sale | 130 | 0.91 | precision 0.72 |
+| surprise spike (no event) | 28 | 0.64 | caught once traffic starts; 0% *before* it starts -- nothing can predict it |
+| decoy event (announced, fizzled) | 0 | -- | **0 of 277 decoy rows flagged** |
+| ordinary records | 11 | 0.00 | |
+
+Early warning (hot next window, still quiet this window -- invisible to a
+reactive system): the engine flags 65% of announced flash sales before
+their first hot window (20 cases); unannounced onsets are not predictable.
+
+#### What changed, and why the old 0.147 isn't comparable
+
+The previous engine scored F1 ~0.147. Diagnosis on 46 recorded scenarios
+(scenario-grouped CV) found the label, not the model, was the limit: the
+old "next window > 3x the last-5-window mean" rule fired on only 1% of
+samples, 80% of those on low-traffic Zipf-tail noise, and only 54 of 1,050
+genuine flash-sale rows were positive (50 of them in the first two spike
+windows). A model that knew *exactly* which records were flash-sale
+records scored F1 0.08 against that label. So **part of the jump to
+~0.74 is a redefinition of success** (sustained surge instead of
+one-window rising edge), which matches what relocation actually needs.
+The part that is genuine model improvement: on the *old* label, history
+features alone lifted F1 from 0.27 to 0.41 in the same experiment.
+
+Other findings from that diagnosis, all fixed here: event signal leaked
+into replay before announcement; the z-scored event feature lost timing;
+the trend model (slope of heat scores) was weaker than the raw current
+rate; the adaptive threshold was fed the broken label; heat-index weight
+refits could collapse onto one feature (now ridge-regularised, smoothed,
+floored at 0.02).
+
+Limits to be honest about: all data is simulated; the sub-model ablation
+shows the trend model adds little on top of XGBoost (blend weight 0.9);
+a 24-config hyper-parameter sweep moved held-out AP by only 0.78-0.80, so
+the remaining ceiling is information (unannounced spikes), not tuning.
 
 ### Dependency Graph (Stage 5)
 
@@ -297,7 +333,7 @@ as intended.
 
 `check_outcomes.py` closes the loop: for every planned move, it checks
 whether the record actually went hot in the following window (reusing
-`HeatIndex`'s own spike rule) and feeds that outcome into a fresh
+the shared `predictor/labels.py` hot rule) and feeds that outcome into a fresh
 `AdaptiveThreshold`. In one real run, 9 of 10 relocated records turned
 out to be false positives (from noisy early-window candidates) and only
 the genuine flash-sale record was correctly hot -- that low precision
@@ -307,7 +343,7 @@ behavior the methodology calls for.
 ### Baselines & Benchmarking (Stage 7)
 
 ```bash
-python planner/evaluate.py --min-probability 0.5
+python planner/evaluate.py
 ```
 
 Run after `predictor/run_prediction.py`. Implements the two comparison
@@ -324,88 +360,94 @@ against the same recorded scenario:
   point (the earliest window with an actionable prediction)
 
 Each system is judged at *its own* natural decision point rather than
-one shared snapshot -- reactive scans the scenario chronologically for
-the first window where load actually crosses the threshold, which is
-later than HeatShard's proactive trigger by design. Ground truth ("did
-a record actually become hot") reuses `HeatIndex`'s own spike rule,
-scanned across the whole scenario. `evaluate.py` prints a results table
-and renders `data/evaluation.png` with the methodology's five defined
-metrics (Section 4.3): data movement, precision, recall, false-positive
-rate, and load variance before/after.
+one shared snapshot: reactive scans the scenario chronologically (once it
+has a full lookback of history) for the first window where load actually
+crosses the threshold; HeatShard acts at the earliest window with an
+actionable prediction. Ground truth ("did a record actually become hot")
+is the shared `predictor/labels.py` rule -- a sustained surge against the
+record's own lagged baseline -- scanned across the whole scenario.
+`evaluate.py` prints a results table for one scenario and renders
+`data/evaluation.png` with the methodology's five defined metrics
+(Section 4.3): data movement, precision, recall, false-positive rate, and
+load variance before/after.
 
-A representative run:
-
-```
-system         moved  precision   recall   FP rate  var before  var after
-static             0       0.00     0.00      0.00        1370       1370
-reactive          18       0.06     0.11      0.94        1457       3089
-heatshard          1       1.00     0.11      0.00        1370        580
-
-HeatShard acted 12s earlier than the reactive baseline would have noticed anything
-```
-
-Two findings stood out and are worth keeping for the report's Results
-section:
-
-1. **The reactive baseline's blind "migrate everything to the
-   least-loaded shard" strategy makes load variance *worse*, not
-   better** (1457 -> 3089) -- dumping an entire overloaded shard onto a
-   single destination just creates a new hotspot there. HeatShard's
-   variance-aware placement (Benefit = actual variance reduction) cuts
-   variance by more than half using 18x less data movement.
-2. **Precision/recall vary meaningfully run to run**, and one honest
-   edge case is worth documenting rather than hiding: a genuine
-   ground-truth spike record can have too large an individual load to
-   fit any single destination shard without overshooting and making
-   variance worse, in which case the planner (correctly, by its own
-   ExpectedValue logic) declines to move it -- it isn't a bug, but it
-   does mean the current single-destination-per-record design
-   sometimes passes over the "obvious" candidate in favor of a smaller,
-   more placement-friendly one. Worth flagging in the report's
-   limitations section (Stage 9) alongside decision-support scope and
-   cross-shard join tradeoffs.
-
-**The single-run numbers above are illustrative of the mechanism, not
-the headline result** -- a single scenario's precision/recall/lead-time
-turned out to vary hugely by seed. `planner/evaluate_aggregate.py` runs
-N independent scenarios and reports mean +/- std instead:
+**One scenario is illustrative, not a result.** Precision, recall and
+timing vary a lot by seed, so the headline numbers come from
+`planner/evaluate_aggregate.py`, which runs N independent, freshly seeded
+scenarios and reports mean +/- std:
 
 ```bash
 python planner/evaluate_aggregate.py --num-runs 15 --seed-start 5000
+# re-score already-generated scenarios (e.g. with a different --min-probability):
+python planner/evaluate_aggregate.py --num-runs 15 --seed-start 5000 --reuse-existing
 ```
 
-Real result over 15 runs (never used in training):
+The 15 scenarios are drawn from the same varied, deliberately imperfect
+distribution the model trains on (unannounced surprise spikes, decoy
+events that never surge, ramped spikes, 3-5 s windows) but with seeds the
+model never saw. Variance is reported two ways: at each system's *own
+decision time*, and at the *load peak* -- the window where the cluster is
+most imbalanced -- so a system that acts early is not penalised for the
+load not having built up yet, and one that acts late is not credited for
+it.
 
-```
-system       metric                     mean        std
-reactive     data_movement             13.73       3.96
-heatshard    data_movement              2.73       1.48
-reactive     precision                  0.09       0.07
-heatshard    precision                  0.27       0.27
-reactive     recall                     0.31       0.25
-heatshard    recall                     0.19       0.16
-reactive     false_positive_rate        0.91       0.07
-heatshard    false_positive_rate        0.66       0.31
-static/heatshard  variance before    2270.04
-reactive          variance before     275.27
-static            variance after     2270.04  (unchanged, as expected)
-reactive           variance after     684.10   (worse than before)
-heatshard           variance after   1006.02   (-56% vs before)
+Result over 15 never-trained-on scenarios (mean +/- std):
 
-HeatShard lead time over reactive: mean=2.2s std=4.6s (n=15/15)
-```
+| metric | static | reactive | **HeatShard** |
+|---|---|---|---|
+| records moved | 0 | 22.9 +/- 9.9 | **2.3 +/- 1.4** |
+| precision | -- | 0.05 +/- 0.04 | **0.93 +/- 0.25** |
+| recall | -- | 0.20 +/- 0.18 | **0.38 +/- 0.19** |
+| false-positive rate | -- | 0.89 +/- 0.24 | **0.00** |
+| load variance, at decision time (before -> after) | 2620 | 3636 -> 8428 (**worse**) | 2620 -> 1246 (**-52%**) |
+| load variance, at the load peak (before -> after) | 6869 | 6869 -> 10938 (**+59%**) | 6869 -> 5117 (**-26%**) |
 
-What actually holds up: HeatShard reduces load variance by ~56% on
-average while moving ~5x less data than reactive; reactive's blind
-strategy makes variance *worse* on average, not just in one run. What
-doesn't hold up: the 21s lead-time and precision-up-to-100% numbers
-above were an outlier run, not typical -- the real average lead time is
-2.2s with a *larger* standard deviation than the mean, and precision
-ranges from 0 to 1.0 by seed with no stable operating point. One
-number the single-run framing hid entirely: reactive's average recall
-(0.31) is higher than HeatShard's (0.19) -- the blunt approach catches
-more genuinely-hot records on average, just far more wastefully. Report
-the aggregated numbers, not a cherry-picked run, in the Results section.
+What holds up:
+
+- **~10x less data movement** than reactive, with near-perfect precision
+  and zero false-positive relocations.
+- **Reactive's blind "migrate the whole shard to the least-loaded shard"
+  makes balance worse, not better**, on average -- it dumps an entire shard
+  onto one destination and creates a new hotspot there.
+- At its decision moment HeatShard lowers load variance in 14 of 15 runs
+  (the 15th found no positive-expected-value move and did nothing).
+
+What does not hold up, stated plainly:
+
+- **The balance benefit at the load peak is modest and uneven.** Variance
+  at the peak drops in only 9 of 15 runs; the per-run median reduction is
+  ~5% (mean 16%). The pooled -26% in the table is dominated by the few
+  high-variance scenarios where a relocated record mattered most, so
+  quote it with that caveat. The decision-time -52% flatters the system.
+- **Recall is low (0.38).** HeatShard moves ~2 records per scenario while
+  ~6 become hot. Some are unannounced surprise spikes nothing can predict
+  early; the planner also declines moves whose expected value is not
+  positive, and relocates each record to a single destination only.
+- **There is no real lead-time advantage in this protocol.** HeatShard
+  acted before the first hot window in only 2 of 15 runs (mean -0.3 s
+  +/- 2.5 s). It cannot commit on an announcement alone because decoy
+  events (announced, never surge) are in the data: a calibrated model
+  honestly reports ~0.1-0.2 probability at that moment. It commits the
+  window traffic appears -- but then well before the surge is established
+  (hot windows last ~4). Reactive "acts before the first hot window" in 7
+  of 14 runs only because its untuned 1.5x threshold fires on ordinary
+  Zipf skew (89% false-positive relocations), not because it anticipates
+  anything.
+- Precision is bimodal: 1.0 in 14 runs, 0.0 in the run with no moves.
+
+Sensitivity of the planner's candidate-probability floor (picked on 16
+*validation* scenarios, `planner/sweep_probability_floor.py`, not on the
+15 above): lowering it makes HeatShard act earlier but worse -- at 0.15 it
+acts before the first hot window in 12/16 runs but peak-variance
+reduction falls from 54% to 45% and precision from 0.88 to 0.77, and at
+0.05 it collapses (precision 0.12). 0.3 was best on every balance metric,
+so it stays the default.
+
+Superseded numbers: earlier aggregated results in this README (precision
+0.27, recall 0.19, lead time 2.2 s, -56% variance) were produced with the
+v1 prediction engine, the easier simulator and an evaluation directory
+that could be reused across runs (the collector appends to an existing
+db); they are not comparable and should not be quoted.
 
 ### Dashboard (Stage 8)
 

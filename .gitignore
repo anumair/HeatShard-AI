@@ -18,4 +18,5 @@ data/training_v2/
 data/test_v2/
 data/*.log
 data/prediction_eval.json
+data/evaluation_aggregate.json
 data/eval_runs/

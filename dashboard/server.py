@@ -1,7 +1,7 @@
 """Stage 8: HeatShard AI live dashboard backend.
 
 A thin FastAPI layer over the existing pipeline -- every endpoint reuses
-Stage 1-7's own modules directly (ShardCluster, DependencyGraph,
+Stage 1-7's own modules directly (ShardCluster,
 compute_plan, reactive_plan, evaluate_system, ...) rather than
 reimplementing any of their logic. The only new code here is data
 shaping for the frontend and two controls for running the live demo:
@@ -30,7 +30,6 @@ import planner.storage as planner_storage  # noqa: E402
 import predictor.storage as heat_storage  # noqa: E402
 from collector.storage import DEFAULT_DB_PATH  # noqa: E402
 from common.shard_client import ShardCluster  # noqa: E402
-from planner.dependency_graph import DEFAULT_MIN_CO_ACCESS, DependencyGraph  # noqa: E402
 from planner.evaluate import evaluate_system, ever_hot_records, find_reactive_trigger, first_hot_window_start  # noqa: E402
 from planner.reactive_baseline import DEFAULT_THRESHOLD_MULTIPLIER, reactive_plan  # noqa: E402
 from planner.run_relocation import MIN_CANDIDATE_PROBABILITY, compute_plan  # noqa: E402
@@ -188,19 +187,49 @@ def get_shard_load(window_lookback: int = 5):
     return {"shards": [{"name": k, "load": v} for k, v in shard_load.items()], "average": avg}
 
 
+def _prediction_windows(conn):
+    """One row per prediction window: start, end, max P(hot), how many flagged."""
+    return [
+        dict(r)
+        for r in conn.execute(
+            "SELECT window_start, window_end, MAX(p_ensemble) AS max_p, SUM(flagged) AS flagged "
+            "FROM predictions GROUP BY window_start, window_end ORDER BY window_start ASC"
+        ).fetchall()
+    ]
+
+
 @app.get("/api/records")
-def get_records(limit: int = 300):
+def get_records(limit: int = 300, window_start: float = None):
+    """Per-record heat / P(hot) for one window. Defaults to the PEAK window
+    (the one with the highest P(hot)), not the latest: the latest window of a
+    finished scenario is its cooldown, where every record is quiet and the
+    chart would look empty."""
     if not DEFAULT_DB_PATH.exists():
-        return {"window_start": None, "records": []}
+        return {"window_start": None, "records": [], "windows": []}
 
     conn = sqlite3.connect(DEFAULT_DB_PATH)
     conn.row_factory = sqlite3.Row
-    latest_pred = conn.execute("SELECT MAX(window_start) FROM predictions").fetchone()[0]
-    latest_mw = conn.execute("SELECT MAX(window_start) FROM metric_windows").fetchone()[0]
-    window_start = latest_pred if latest_pred is not None else latest_mw
+    pred_windows = _prediction_windows(conn)
+    manifest = load_manifest()
+    phases = manifest.get("phases") if manifest else None
+    windows = [
+        {
+            "window_start": w["window_start"],
+            "phase": phase_for(w["window_start"], w["window_end"], phases),
+            "max_p": w["max_p"],
+            "flagged": int(w["flagged"] or 0),
+        }
+        for w in pred_windows
+    ]
+    peak = max(windows, key=lambda w: (w["max_p"] or 0)) if windows else None
+    if window_start is None:
+        if peak is not None:
+            window_start = peak["window_start"]
+        else:
+            window_start = conn.execute("SELECT MAX(window_start) FROM metric_windows").fetchone()[0]
     if window_start is None:
         conn.close()
-        return {"window_start": None, "records": []}
+        return {"window_start": None, "records": [], "windows": windows}
 
     mw = {r["record_id"]: dict(r) for r in conn.execute(
         "SELECT * FROM metric_windows WHERE window_start = ?", (window_start,)
@@ -227,7 +256,83 @@ def get_records(limit: int = 300):
             "flagged": bool(p.get("flagged")),
         })
     records.sort(key=lambda r: (r["p_ensemble"] if r["p_ensemble"] is not None else (r["heat_score"] or 0)), reverse=True)
-    return {"window_start": window_start, "records": records[:limit]}
+    return {
+        "window_start": window_start,
+        "peak_window_start": peak["window_start"] if peak else None,
+        "records": records[:limit],
+        "windows": windows,
+    }
+
+
+@app.get("/api/prediction-timeline")
+def get_prediction_timeline(top: int = 6):
+    """P(hot) over time for the records that got hottest, with the scenario's
+    phases and the adaptive threshold -- the Stage 4 checkpoint as a picture."""
+    if not DEFAULT_DB_PATH.exists():
+        return {"available": False}
+    conn = sqlite3.connect(DEFAULT_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    windows = _prediction_windows(conn)
+    if not windows:
+        conn.close()
+        return {"available": False}
+    t0 = windows[0]["window_start"]
+
+    top_ids = [
+        r["record_id"]
+        for r in conn.execute(
+            "SELECT record_id, MAX(p_ensemble) AS m FROM predictions GROUP BY record_id ORDER BY m DESC LIMIT ?", (top,)
+        ).fetchall()
+    ]
+    manifest = load_manifest() or {}
+    kinds = {}
+    for key, label in (("event_spike_records", "announced"), ("surprise_records", "surprise"), ("decoy_records", "decoy")):
+        for rid in manifest.get(key, []):
+            kinds[rid] = label
+    if not manifest.get("event_spike_records"):  # older manifests: every spike record was announced
+        for rid in manifest.get("spike_records", []):
+            kinds.setdefault(rid, "announced")
+
+    series = []
+    for rid in top_ids:
+        rows = conn.execute(
+            "SELECT window_start, p_ensemble, flagged FROM predictions WHERE record_id = ? ORDER BY window_start", (rid,)
+        ).fetchall()
+        series.append({
+            "record_id": rid,
+            "kind": kinds.get(rid, "other"),
+            "points": [{"t": r["window_start"] - t0, "p": r["p_ensemble"], "flagged": bool(r["flagged"])} for r in rows],
+        })
+    thresholds = [
+        {"t": r["window_start"] - t0, "threshold": r["threshold"]}
+        for r in conn.execute("SELECT window_start, MAX(threshold) AS threshold FROM predictions GROUP BY window_start ORDER BY window_start").fetchall()
+    ]
+    conn.close()
+
+    phases = [
+        {"name": ph["name"], "start": ph["start"] - t0, "end": ph["end"] - t0}
+        for ph in (manifest.get("phases") or [])
+    ]
+    registered = manifest.get("event_registered_at")
+    return {
+        "available": True,
+        "series": series,
+        "thresholds": thresholds,
+        "phases": phases,
+        "event_announced_at": (registered - t0) if registered else None,
+    }
+
+
+@app.get("/api/aggregate-evaluation")
+def get_aggregate_evaluation():
+    """Stored result of planner/evaluate_aggregate.py (N independent scenarios)."""
+    path = Path(__file__).resolve().parent.parent / "data" / "evaluation_aggregate.json"
+    if not path.exists():
+        return {"available": False, "reason": "run planner/evaluate_aggregate.py to generate the multi-scenario results"}
+    with open(path) as f:
+        data = json.load(f)
+    data["available"] = True
+    return data
 
 
 @app.get("/api/relocation-plan")
@@ -296,16 +401,6 @@ def get_evaluation(min_probability: float = MIN_CANDIDATE_PROBABILITY, threshold
         "lead_vs_first_hot_seconds": (first_hot - heatshard_window) if first_hot is not None else None,
         "results": results,
     }
-
-
-@app.get("/api/dependency-graph")
-def get_dependency_graph(min_co_access: int = DEFAULT_MIN_CO_ACCESS):
-    if not DEFAULT_DB_PATH.exists():
-        return {"nodes": [], "edges": [], "num_components": 0}
-    graph = DependencyGraph.build(str(DEFAULT_DB_PATH), min_co_access=min_co_access)
-    nodes = [{"id": r, "role": r.split(":")[0]} for r in graph.records()]
-    edges = [{"source": a, "target": b, "weight": w} for a, b, w in graph.all_edges()]
-    return {"nodes": nodes, "edges": edges, "num_components": len(graph.connected_components())}
 
 
 @app.get("/api/weight-history")

@@ -465,18 +465,28 @@ python -m uvicorn dashboard.server:app --host 127.0.0.1 --port 8420
 ```
 
 A single-page dashboard (`dashboard/server.py` + `dashboard/static/`) that reuses
-every stage's modules directly -- `ShardCluster`, `DependencyGraph`,
+every stage's modules directly -- `ShardCluster`,
 `compute_plan`, `reactive_plan`, `evaluate_system`, etc. -- rather than
 reimplementing any of their logic. Panels:
 
 - **Shard load** and a **live scenario log** (streams a running
   `flash_sale_scenario.py` subprocess in real time)
-- **Records** -- a heat/prediction scatter plus table, flagged hotspots highlighted
+- **Records** -- a heat/prediction scatter plus table, flagged hotspots
+  highlighted. A window slider picks which window to inspect; it opens on the
+  *peak* window (highest P(hotspot)) because the latest window of a finished
+  scenario is its quiet cooldown
+- **P(hotspot) over time** -- the six hottest records' probability lines over
+  the scenario's phase bands, the adaptive threshold (dashed), the moment the
+  event was announced, and large dots where a record was flagged
 - **Relocation plan** -- the current plan's moves with cost/benefit/EV
-- **Dependency graph** -- the Stage 5 co-access triangles, rendered as an
-  interactive SVG (hover a node for its id)
-- **Evaluation** -- the Stage 7 static/reactive/HeatShard comparison,
-  including the lead-time headline stat, recomputed live
+- **Evaluation (this scenario)** -- the Stage 7 static/reactive/HeatShard
+  comparison recomputed live. Reported as counts ("1 of 1 moves truly hot"),
+  not percentages: one scenario moves a handful of records, so a "100%
+  precision" headline would be meaningless
+- **Evaluation (many unseen scenarios)** -- reads `data/evaluation_aggregate.json`
+  (written by `planner/evaluate_aggregate.py`): per-scenario dots with mean and
+  +/- 1 std for records moved, precision, recall and peak-load variance, plus
+  headline stats (e.g. precision perfect in 14 of 15 runs, one run made no move)
 - **System self-tuning** -- the heat index's weight-refit history and the
   adaptive confidence threshold over time, with a clear empty-state
   message when a scenario hasn't produced enough windows to trigger either

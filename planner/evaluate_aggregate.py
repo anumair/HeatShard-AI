@@ -14,7 +14,9 @@ the headline numbers are actually defensible.
 """
 
 import argparse
+import json
 import subprocess
+import time
 import sys
 from pathlib import Path
 
@@ -39,6 +41,7 @@ from simulator.flash_sale_scenario import run as run_scenario  # noqa: E402
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 EVAL_DIR = PROJECT_ROOT / "data" / "eval_runs"
 DEFAULT_OUT_PATH = PROJECT_ROOT / "data" / "evaluation_aggregate.png"
+DEFAULT_JSON_PATH = PROJECT_ROOT / "data" / "evaluation_aggregate.json"
 
 METRICS = [
     "data_movement", "precision", "recall", "false_positive_rate",
@@ -148,6 +151,7 @@ def main():
     parser.add_argument("--min-probability", type=float, default=MIN_CANDIDATE_PROBABILITY)
     parser.add_argument("--threshold-multiplier", type=float, default=DEFAULT_THRESHOLD_MULTIPLIER)
     parser.add_argument("--out", default=str(DEFAULT_OUT_PATH))
+    parser.add_argument("--json-out", default=str(DEFAULT_JSON_PATH), help="per-run + summary metrics, read by the dashboard's aggregate panel")
     args = parser.parse_args()
 
     EVAL_DIR.mkdir(parents=True, exist_ok=True)
@@ -242,6 +246,22 @@ def main():
         if values:
             v = np.array(values)
             print(f"  {name:<10} mean={v.mean():+.1f}s std={v.std():.1f}s  acted before the first hot window in {int((v > 0).sum())}/{len(v)} runs")
+
+    with open(args.json_out, "w") as f:
+        json.dump(
+            {
+                "generated_at": time.time(),
+                "n_runs": completed,
+                "seed_start": args.seed_start,
+                "min_probability": args.min_probability,
+                "summary": summary,
+                "per_run": per_system_metrics,
+                "lead_vs_first_hot": lead_vs_first_hot,
+                "lead_over_reactive": lead_times,
+            },
+            f,
+            indent=2,
+        )
 
     plot_summary(summary, args.out, completed)
     print(f"\nwrote {args.out}")

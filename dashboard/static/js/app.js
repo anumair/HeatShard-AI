@@ -1,6 +1,6 @@
 /* HeatShard AI dashboard — polls the FastAPI backend and renders every panel.
    No build step, no framework: plain fetch + Chart.js + hand-rolled SVG for
-   the dependency graph, matching the rest of this project's "no unnecessary
+   the charts, matching the rest of this project's "no unnecessary
    dependency" style. */
 
 const COLORS = {
@@ -222,13 +222,51 @@ async function refreshShardLoad() {
 /* ------------------------------------------------------------------ */
 /* Records: heat / prediction scatter + table                          */
 /* ------------------------------------------------------------------ */
+// null = follow the PEAK window (highest P(hotspot)) -- the latest window of a
+// finished scenario is its cooldown, where everything is quiet and the chart
+// would look empty. Moving the slider pins a specific window.
+let selectedWindow = null;
+let recordWindows = [];
+
+function syncWindowPicker(data) {
+  const slider = $("windowSlider");
+  recordWindows = data.windows || [];
+  const n = recordWindows.length;
+  slider.disabled = n === 0;
+  slider.max = Math.max(0, n - 1);
+  const idx = Math.max(0, recordWindows.findIndex((w) => w.window_start === data.window_start));
+  slider.value = idx;
+  if (!n) {
+    $("windowLabel").textContent = "–";
+    $("recordsSub").textContent = "size = access count, color = flagged";
+    return;
+  }
+  const w = recordWindows[idx];
+  const isPeak = data.window_start === data.peak_window_start;
+  $("windowLabel").textContent =
+    `${idx + 1}/${n} · ${w.phase || "?"} · max P ${fmt(w.max_p)} · ${w.flagged} flagged${isPeak ? " · PEAK" : ""}`;
+  $("recordsSub").textContent = `window ${idx + 1} of ${n}${isPeak ? " (peak)" : ""} · size = access count, color = flagged`;
+}
+
+$("windowSlider").addEventListener("input", () => {
+  const w = recordWindows[parseInt($("windowSlider").value, 10)];
+  if (!w) return;
+  selectedWindow = w.window_start;
+  refreshRecords();
+});
+$("btnPeak").addEventListener("click", () => {
+  selectedWindow = null;
+  refreshRecords();
+});
+
 async function refreshRecords() {
   let data;
   try {
-    data = await api("/api/records");
+    data = await api("/api/records" + (selectedWindow !== null ? `?window_start=${selectedWindow}` : ""));
   } catch (e) {
     return;
   }
+  syncWindowPicker(data);
   const records = data.records || [];
 
   const flagged = records.filter((r) => r.flagged);
@@ -288,6 +326,113 @@ async function refreshRecords() {
 }
 
 /* ------------------------------------------------------------------ */
+/* P(hotspot) over time                                                */
+/* ------------------------------------------------------------------ */
+const PHASE_TINT = {
+  baseline: "rgba(255,255,255,0.025)",
+  pre_spike: "rgba(251,191,36,0.07)",
+  spike: "rgba(249,115,22,0.10)",
+  cooldown: "rgba(96,165,250,0.05)",
+};
+
+// Draws the scenario's phase bands behind the lines, plus a vertical marker
+// for when the flash-sale event was announced.
+const phaseBandsPlugin = {
+  id: "phaseBands",
+  beforeDatasetsDraw(chart, _args, opts) {
+    if (!opts || !opts.phases) return;
+    const { ctx, chartArea, scales } = chart;
+    const x = scales.x;
+    ctx.save();
+    ctx.font = "600 10px -apple-system, sans-serif";
+    ctx.textBaseline = "top";
+    opts.phases.forEach((ph) => {
+      const left = Math.max(chartArea.left, x.getPixelForValue(ph.start));
+      const right = Math.min(chartArea.right, x.getPixelForValue(ph.end));
+      if (right <= left) return;
+      ctx.fillStyle = PHASE_TINT[ph.name] || "rgba(255,255,255,0.03)";
+      ctx.fillRect(left, chartArea.top, right - left, chartArea.bottom - chartArea.top);
+      ctx.fillStyle = COLORS.faint;
+      ctx.fillText(ph.name.toUpperCase(), left + 6, chartArea.top + 5);
+    });
+    if (opts.eventAt !== null && opts.eventAt !== undefined) {
+      const ex = x.getPixelForValue(opts.eventAt);
+      if (ex >= chartArea.left && ex <= chartArea.right) {
+        ctx.strokeStyle = COLORS.brand;
+        ctx.setLineDash([3, 3]);
+        ctx.beginPath();
+        ctx.moveTo(ex, chartArea.top);
+        ctx.lineTo(ex, chartArea.bottom);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = COLORS.brand;
+        ctx.fillText("event announced", ex + 5, chartArea.bottom - 14);
+      }
+    }
+    ctx.restore();
+  },
+};
+
+async function refreshTimeline() {
+  let data;
+  try {
+    data = await api("/api/prediction-timeline");
+  } catch (e) {
+    return;
+  }
+  $("emptyTimeline").hidden = !!data.available;
+  if (!data.available) {
+    if (charts.chartTimeline) {
+      charts.chartTimeline.destroy();
+      delete charts.chartTimeline;
+    }
+    return;
+  }
+
+  const palette = ["#22d3ee", "#f97316", "#a78bfa", "#34d399", "#f472b6", "#fbbf24"];
+  const kindLabel = { announced: "announced sale", surprise: "surprise spike", decoy: "decoy event", other: "" };
+  const datasets = data.series.map((sr, i) => ({
+    label: `${shortId(sr.record_id)}${kindLabel[sr.kind] ? " · " + kindLabel[sr.kind] : ""}`,
+    data: sr.points.map((p) => ({ x: p.t, y: p.p })),
+    borderColor: palette[i % palette.length],
+    backgroundColor: palette[i % palette.length],
+    borderWidth: 2,
+    tension: 0.25,
+    pointRadius: sr.points.map((p) => (p.flagged ? 5 : 1.5)),
+    pointHoverRadius: 6,
+  }));
+  datasets.push({
+    label: "acting threshold",
+    data: data.thresholds.map((t) => ({ x: t.t, y: t.threshold })),
+    borderColor: COLORS.dim,
+    borderDash: [6, 4],
+    borderWidth: 1.5,
+    pointRadius: 0,
+    stepped: true,
+  });
+
+  ensureChart("chartTimeline", {
+    type: "line",
+    data: { datasets },
+    plugins: [phaseBandsPlugin],
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: "nearest", intersect: false },
+      plugins: {
+        phaseBands: { phases: data.phases, eventAt: data.event_announced_at },
+        legend: { position: "top" },
+        tooltip: { callbacks: { title: (items) => `t = ${fmt(items[0].parsed.x, 0)} s`, label: (c) => `${c.dataset.label}: P ${fmt(c.parsed.y)}` } },
+      },
+      scales: {
+        x: { type: "linear", title: { display: true, text: "seconds into scenario" }, grid: { color: COLORS.grid } },
+        y: { title: { display: true, text: "P(hotspot next window)" }, min: 0, max: 1, grid: { color: COLORS.grid } },
+      },
+    },
+  });
+}
+
+/* ------------------------------------------------------------------ */
 /* Relocation plan                                                     */
 /* ------------------------------------------------------------------ */
 async function refreshPlan() {
@@ -326,93 +471,6 @@ async function refreshPlan() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Dependency graph (hand-rolled SVG)                                  */
-/* ------------------------------------------------------------------ */
-async function refreshGraph() {
-  let data;
-  try {
-    data = await api("/api/dependency-graph");
-  } catch (e) {
-    return;
-  }
-  const svg = $("depGraph");
-  svg.innerHTML = "";
-  $("graphSub").textContent = `${data.nodes.length} records · ${data.num_components} triangle(s)`;
-
-  if (!data.nodes.length) {
-    return;
-  }
-
-  // connected components via union-find over the edge list
-  const parent = {};
-  const find = (x) => (parent[x] === x || !parent[x] ? (parent[x] = parent[x] || x) : (parent[x] = find(parent[x])));
-  const union = (a, b) => {
-    const ra = find(a), rb = find(b);
-    if (ra !== rb) parent[ra] = rb;
-  };
-  data.nodes.forEach((n) => (parent[n.id] = n.id));
-  data.edges.forEach((e) => union(e.source, e.target));
-
-  const groups = {};
-  data.nodes.forEach((n) => {
-    const root = find(n.id);
-    (groups[root] = groups[root] || []).push(n.id);
-  });
-
-  const components = Object.values(groups).slice(0, 24);
-  const cols = 6;
-  const cellW = 100, cellH = 85, pad = 30;
-  const positions = {};
-
-  components.forEach((comp, idx) => {
-    const cx = pad + (idx % cols) * cellW + cellW / 2;
-    const cy = pad + Math.floor(idx / cols) * cellH + cellH / 2;
-    const n = comp.length;
-    comp.forEach((id, i) => {
-      const angle = (2 * Math.PI * i) / Math.max(n, 1) - Math.PI / 2;
-      const radius = n === 1 ? 0 : 26;
-      positions[id] = { x: cx + radius * Math.cos(angle), y: cy + radius * Math.sin(angle) };
-    });
-  });
-
-  const ns = "http://www.w3.org/2000/svg";
-  const rows = Math.ceil(components.length / cols);
-  svg.setAttribute("viewBox", `0 0 ${cols * cellW + pad} ${Math.max(rows * cellH + pad, 200)}`);
-
-  data.edges.forEach((e) => {
-    const a = positions[e.source], b = positions[e.target];
-    if (!a || !b) return;
-    const line = document.createElementNS(ns, "line");
-    line.setAttribute("x1", a.x); line.setAttribute("y1", a.y);
-    line.setAttribute("x2", b.x); line.setAttribute("y2", b.y);
-    line.setAttribute("stroke", "rgba(255,255,255,0.15)");
-    line.setAttribute("stroke-width", "1.5");
-    svg.appendChild(line);
-  });
-
-  const tooltip = $("graphTooltip");
-  data.nodes.forEach((n) => {
-    const pos = positions[n.id];
-    if (!pos) return;
-    const circle = document.createElementNS(ns, "circle");
-    circle.setAttribute("cx", pos.x); circle.setAttribute("cy", pos.y);
-    circle.setAttribute("r", 7);
-    circle.setAttribute("fill", COLORS.roles[n.role] || "#888");
-    circle.setAttribute("stroke", "#0a0e14");
-    circle.setAttribute("stroke-width", "1.5");
-    circle.style.cursor = "pointer";
-    circle.addEventListener("mousemove", (ev) => {
-      tooltip.hidden = false;
-      tooltip.textContent = shortId(n.id);
-      tooltip.style.left = `${ev.offsetX + 12}px`;
-      tooltip.style.top = `${ev.offsetY + 4}px`;
-    });
-    circle.addEventListener("mouseleave", () => (tooltip.hidden = true));
-    svg.appendChild(circle);
-  });
-}
-
-/* ------------------------------------------------------------------ */
 /* Evaluation                                                          */
 /* ------------------------------------------------------------------ */
 async function refreshEvaluation() {
@@ -437,26 +495,37 @@ async function refreshEvaluation() {
         ? { value: fmt(leadVsHot, 0) + "s", label: "HeatShard acted BEFORE the first hotspot" }
         : { value: fmt(-leadVsHot, 0) + "s", label: "HeatShard acted AFTER the first hotspot appeared" };
 
+  const hs = byName.heatshard;
+  const re = byName.reactive;
+  const hits = (r) => Math.round(r.precision * r.data_movement); // moves that were truly hot
+  const movesText = (r) => (r.data_movement ? `${hits(r)} of ${r.data_movement}` : "none");
+
   $("evalHeadline").innerHTML = `
     <div class="eval-stat accent"><div class="v">${timing.value}</div><div class="l">${timing.label}</div></div>
     <div class="eval-stat"><div class="v">${data.ground_truth_hot_count}</div><div class="l">records actually hot</div></div>
-    <div class="eval-stat good"><div class="v">${fmt(byName.heatshard.precision * 100, 0)}%</div><div class="l">HeatShard precision</div></div>
-    <div class="eval-stat bad"><div class="v">${fmt(byName.reactive.data_movement, 0)}×</div><div class="l">reactive data movement</div></div>
+    <div class="eval-stat good"><div class="v">${movesText(hs)}</div><div class="l">HeatShard moves that were truly hot</div><div class="s">recall ${fmt(hs.recall * 100, 0)}% of the hot records</div></div>
+    <div class="eval-stat bad"><div class="v">${movesText(re)}</div><div class="l">reactive moves that were truly hot</div><div class="s">${re.data_movement} records moved in total</div></div>
   `;
 
   const labels = results.map((r) => r.name);
   const colors = results.map((r) => COLORS.systems[r.name]);
 
+  // "static" never moves anything, so precision / recall / FP rate are undefined
+  // for it -- showing three empty bars for it only added noise.
+  const acting = results.filter((r) => r.name !== "static");
+  const actingLabels = acting.map((r) => r.name);
+  const actingColors = acting.map((r) => COLORS.systems[r.name]);
+
   ensureChart("chartMovement", barConfig(labels, results.map((r) => r.data_movement), colors, "records moved"));
-  ensureChart("chartFpRate", barConfig(labels, results.map((r) => r.false_positive_rate), colors, "FP rate", 1));
+  ensureChart("chartFpRate", barConfig(actingLabels, acting.map((r) => r.false_positive_rate), actingColors, "false-positive rate", 1));
 
   ensureChart("chartPrecRecall", {
     type: "bar",
     data: {
-      labels,
+      labels: actingLabels,
       datasets: [
-        { label: "precision", data: results.map((r) => r.precision), backgroundColor: COLORS.brand, borderRadius: 4 },
-        { label: "recall", data: results.map((r) => r.recall), backgroundColor: COLORS.accent, borderRadius: 4 },
+        { label: "precision", data: acting.map((r) => r.precision), backgroundColor: COLORS.brand, borderRadius: 4 },
+        { label: "recall", data: acting.map((r) => r.recall), backgroundColor: COLORS.accent, borderRadius: 4 },
       ],
     },
     options: chartOptions("precision / recall", 1),
@@ -473,6 +542,152 @@ async function refreshEvaluation() {
     },
     options: chartOptions("load variance"),
   });
+}
+
+/* ------------------------------------------------------------------ */
+/* Aggregate evaluation: per-scenario dots + mean ± std                */
+/* ------------------------------------------------------------------ */
+const mean = (a) => a.reduce((x, y) => x + y, 0) / (a.length || 1);
+const std = (a) => {
+  const m = mean(a);
+  return Math.sqrt(mean(a.map((v) => (v - m) ** 2)));
+};
+const median = (a) => {
+  const b = [...a].sort((x, y) => x - y);
+  const h = Math.floor(b.length / 2);
+  return b.length % 2 ? b[h] : (b[h - 1] + b[h]) / 2;
+};
+
+// Draws a mean ± std bar over each group of dots.
+const errorBarsPlugin = {
+  id: "errorBars",
+  afterDatasetsDraw(chart, _args, opts) {
+    if (!opts || !opts.groups) return;
+    const { ctx, chartArea, scales } = chart;
+    ctx.save();
+    ctx.lineWidth = 2;
+    opts.groups.forEach((g, i) => {
+      const x = scales.x.getPixelForValue(i);
+      const lo = Math.max(scales.y.min, g.mean - g.std);
+      const hi = Math.min(scales.y.max, g.mean + g.std);
+      const y1 = scales.y.getPixelForValue(lo);
+      const y2 = scales.y.getPixelForValue(hi);
+      ctx.strokeStyle = g.color;
+      ctx.beginPath();
+      ctx.moveTo(x, y1);
+      ctx.lineTo(x, y2);
+      ctx.moveTo(x - 7, y1);
+      ctx.lineTo(x + 7, y1);
+      ctx.moveTo(x - 7, y2);
+      ctx.lineTo(x + 7, y2);
+      ctx.stroke();
+    });
+    ctx.restore();
+  },
+};
+
+function stripChart(canvasId, title, groups, max) {
+  const dots = groups.map((g, i) => ({
+    label: g.name,
+    data: g.values.map((v, k) => ({ x: i + (((k * 37) % 100) / 100 - 0.5) * 0.45, y: v })),
+    backgroundColor: g.color + "88",
+    borderColor: g.color,
+    pointRadius: 3.5,
+    order: 2,
+  }));
+  const means = groups.map((g, i) => ({
+    label: `${g.name} mean`,
+    data: [{ x: i, y: mean(g.values) }],
+    backgroundColor: g.color,
+    borderColor: "#fff",
+    borderWidth: 1.5,
+    pointStyle: "rectRot",
+    pointRadius: 8,
+    order: 1,
+  }));
+  ensureChart(canvasId, {
+    type: "scatter",
+    data: { datasets: [...dots, ...means] },
+    plugins: [errorBarsPlugin],
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        title: { display: true, text: title, color: COLORS.faint, font: { size: 10.5, weight: "600" } },
+        errorBars: { groups: groups.map((g) => ({ mean: mean(g.values), std: std(g.values), color: g.color })) },
+        tooltip: { callbacks: { label: (c) => `${c.dataset.label}: ${fmt(c.parsed.y, max === 1 ? 2 : 0)}` } },
+      },
+      scales: {
+        x: {
+          min: -0.6,
+          max: groups.length - 0.4,
+          grid: { display: false },
+          ticks: { stepSize: 1, callback: (v) => (Number.isInteger(v) && groups[v] ? groups[v].name : "") },
+        },
+        y: { beginAtZero: true, max, grid: { color: COLORS.grid } },
+      },
+    },
+  });
+}
+
+async function refreshAggregate() {
+  let data;
+  try {
+    data = await api("/api/aggregate-evaluation");
+  } catch (e) {
+    return;
+  }
+  const empty = $("aggEmpty");
+  if (!data.available) {
+    empty.hidden = false;
+    empty.textContent = data.reason || "No multi-scenario results yet.";
+    $("aggHeadline").innerHTML = "";
+    $("aggNote").textContent = "";
+    return;
+  }
+  empty.hidden = true;
+
+  const run = data.per_run;
+  const n = data.n_runs;
+  const c = COLORS.systems;
+  const hsPrecision = run.heatshard.precision;
+  const nPerfect = hsPrecision.filter((v) => v >= 0.999).length;
+  const nNoMove = run.heatshard.data_movement.filter((v) => v === 0).length;
+  const peakChange = run.heatshard.peak_variance_after.map((a, i) => 1 - a / run.heatshard.peak_variance_before[i]);
+  const nImproved = peakChange.filter((v) => v > 1e-9).length;
+  const lead = (data.lead_vs_first_hot || {}).heatshard || [];
+  const nEarly = lead.filter((v) => v > 0).length;
+
+  $("aggSub").textContent = `${n} never-trained-on scenarios · each dot is one scenario · diamond = mean · bar = ±1 std`;
+  $("aggHeadline").innerHTML = `
+    <div class="eval-stat accent"><div class="v">${fmt(mean(run.heatshard.data_movement), 1)} vs ${fmt(mean(run.reactive.data_movement), 1)}</div><div class="l">records moved: HeatShard vs reactive</div></div>
+    <div class="eval-stat good"><div class="v">${fmt(mean(hsPrecision), 2)} ± ${fmt(std(hsPrecision), 2)}</div><div class="l">HeatShard precision</div><div class="s">${nPerfect} of ${n} runs perfect · ${nNoMove} made no move</div></div>
+    <div class="eval-stat"><div class="v">${fmt(mean(run.heatshard.recall), 2)} ± ${fmt(std(run.heatshard.recall), 2)}</div><div class="l">HeatShard recall</div><div class="s">reactive ${fmt(mean(run.reactive.recall), 2)}</div></div>
+    <div class="eval-stat"><div class="v">${fmt(-100 * median(peakChange), 0)}%</div><div class="l">median per-run change in peak-load variance</div><div class="s">improved in ${nImproved} of ${n} runs</div></div>
+  `;
+
+  stripChart("aggMoved", "records moved per scenario", [
+    { name: "reactive", color: c.reactive, values: run.reactive.data_movement },
+    { name: "heatshard", color: c.heatshard, values: run.heatshard.data_movement },
+  ]);
+  stripChart("aggPrecision", "precision per scenario", [
+    { name: "reactive", color: c.reactive, values: run.reactive.precision },
+    { name: "heatshard", color: c.heatshard, values: run.heatshard.precision },
+  ], 1);
+  stripChart("aggRecall", "recall per scenario", [
+    { name: "reactive", color: c.reactive, values: run.reactive.recall },
+    { name: "heatshard", color: c.heatshard, values: run.heatshard.recall },
+  ], 1);
+  stripChart("aggVariance", "shard-load variance at the load peak", [
+    { name: "static", color: c.static, values: run.static.peak_variance_after },
+    { name: "reactive", color: c.reactive, values: run.reactive.peak_variance_after },
+    { name: "heatshard", color: c.heatshard, values: run.heatshard.peak_variance_after },
+  ]);
+
+  $("aggNote").textContent =
+    `HeatShard acted before the first hotspot in ${nEarly} of ${lead.length} scenarios, so no lead-time advantage is claimed. ` +
+    `Precision is bimodal (perfect or no move), which is why its std is large. Variance is lower-is-better; static = doing nothing.`;
 }
 
 function barConfig(labels, values, colors, title, max) {
@@ -566,9 +781,10 @@ async function refreshAll() {
   await refreshShardLoad();
   if (status && status.db_exists) {
     await refreshRecords();
+    await refreshTimeline();
     await refreshPlan();
-    await refreshGraph();
     await refreshEvaluation();
+    await refreshAggregate();
     await refreshAdaptation();
   }
 }
@@ -580,6 +796,7 @@ $("btnLaunch").addEventListener("click", async () => {
     spike_magnitude: parseFloat($("magnitudeInput").value) || 8,
   };
   $("btnLaunch").disabled = true;
+  selectedWindow = null; // a new scenario has new windows
   $("logBox").textContent = "Starting scenario…";
   try {
     await api("/api/scenario/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
@@ -593,6 +810,7 @@ $("btnLaunch").addEventListener("click", async () => {
 
 $("btnPipeline").addEventListener("click", async () => {
   $("btnPipeline").disabled = true;
+  selectedWindow = null;
   $("btnPipeline").textContent = "Running…";
   try {
     await api("/api/pipeline/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) });
